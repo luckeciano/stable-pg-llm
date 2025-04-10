@@ -49,6 +49,7 @@ from trl import GRPOTrainer, ModelConfig, ScriptArguments, TrlParser, get_peft_c
 
 from open_r1.grpo_entropy_trainer import GRPOEntropyTrainer
 from open_r1.dr_grpo_trainer import DrGRPOTrainer
+from open_r1.ac_trainer import ActorCriticTrainer
 
 
 logger = logging.getLogger(__name__)
