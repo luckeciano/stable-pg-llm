@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 from typing import Any, Union
 from accelerate.utils import gather
+from trl.models import unwrap_model_for_generation
 from open_r1.grpo_entropy_trainer import GRPOEntropyTrainer
 from copy import deepcopy
 
@@ -28,7 +29,7 @@ class ActorCriticTrainer(GRPOEntropyTrainer):
         prompt_completion_ids, completion_ids = self._generate_completions(prompt_ids, prompt_mask, prompts_text, prompts, device)
 
         # Generate critic completions
-        values = self._compute_values(inputs, device)
+        values, values_log_probs, pred_value_log_probs = self._compute_values(inputs, device)
 
         # Compute completion mask
         completion_mask = self._compute_completion_mask(completion_ids, device)
@@ -47,27 +48,22 @@ class ActorCriticTrainer(GRPOEntropyTrainer):
         # Log the metrics - mode
         mode = "eval" if self.control.should_evaluate else "train"
 
-        # Gather the reward per function: this part is crucial, because the rewards are normalized per group and the
-        # completions may be distributed across processes
-        rewards_per_func = gather(rewards_per_func)
-
         # Apply weights to each reward function's output and sum
         rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).sum(dim=1)
 
-        gathered_advantages = self._compute_advantages(rewards, mode)
+        target_value = self._compute_target_value(rewards, self.reward_weights)
 
-        # Slice to keep only the local part of the data
-        process_slice = slice(
-            self.accelerator.process_index * len(prompts),
-            (self.accelerator.process_index + 1) * len(prompts),
-        )
-        advantages = advantages[process_slice]
+        value_scalar = self._compute_value_scalar(target_value, self.reward_weights)
+
+        advantages = self._compute_advantages_from_critic(rewards, value_scalar)
 
         self._log_stats(
             stats_dict={
-                'rewards_per_func': rewards_per_func,
-                'rewards': rewards,
-                'advantages': gathered_advantages,
+                'rewards_per_func': self.accelerator.gather(rewards_per_func),
+                'rewards': self.accelerator.gather(rewards),
+                'advantages': self.accelerator.gather(advantages),
+                'pred_value_log_probs': self.accelerator.gather(pred_value_log_probs),
+                'values': self.accelerator.gather(values.float()),
                 'old_per_token_logps': old_per_token_logps,
                 'prompts_text': prompts_text,
                 'completions_text': completions_text,
@@ -85,7 +81,29 @@ class ActorCriticTrainer(GRPOEntropyTrainer):
             "old_per_token_logps": old_per_token_logps,
             "ref_per_token_logps": ref_per_token_logps,
             "advantages": advantages,
+            "values_log_probs": values_log_probs,
+            "target_value": target_value,
         }
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        policy_loss = super().compute_loss(model, inputs, return_outputs, num_items_in_batch)
+        
+        values_log_probs = inputs["values_log_probs"]
+        target_value = inputs["target_value"]
+
+        # Recompute value predictions with gradients enabled
+        value_loss = self._compute_value_loss(values_log_probs, target_value)
+
+        # Log the metrics
+        mode = "eval" if self.control.should_evaluate else "train"
+        self._metrics[mode]["value_loss"].append(self.accelerator.gather_for_metrics(value_loss).mean().item())
+        
+        total_loss = policy_loss + value_loss
+        return total_loss
+    
+    def _compute_value_loss(self, log_probs, target_ids):
+        loss = F.nll_loss(log_probs, target_ids)
+        return loss
     
     # Format into conversation
     def _make_critic_inputs(self, inputs):
@@ -108,16 +126,18 @@ class ActorCriticTrainer(GRPOEntropyTrainer):
         prompt_ids, prompt_mask, prompts_text = self._compute_prompt_ids_and_mask(critic_inputs)
         
         # Generate critic completions
-        target_log_probs = self._compute_next_token_logits(prompt_ids, prompt_mask, device)
+        values_log_probs = self._compute_next_token_logits(prompt_ids, prompt_mask, device)
 
         # Select the target value token
-        values = target_log_probs.argmax(dim=-1)
+        values = values_log_probs.argmax(dim=-1)
+        # Target value logprobs - gather along second dimension using values indices and squeeze to get 1D tensor
+        pred_value_log_probs = torch.gather(values_log_probs, dim=1, index=values.unsqueeze(-1)).squeeze(-1)
 
-        return values, target_log_probs
+        return values, values_log_probs, pred_value_log_probs
     
     def _compute_next_token_logits(self, input_ids, attention_mask, device):
-        with torch.no_grad():
-            outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
+        with unwrap_model_for_generation(self.model, self.accelerator) as unwrapped_model:
+            outputs = unwrapped_model(input_ids=input_ids, attention_mask=attention_mask)
         
         logits = outputs.logits  # Shape: (batch_size, seq_length, vocab_size)
         # Get indices of the last non-padding tokens in each sequence
@@ -134,12 +154,68 @@ class ActorCriticTrainer(GRPOEntropyTrainer):
         
         # Gather the log probabilities of the target tokens in a vectorized way
         target_log_probs = log_probs[:, target_ids]
+
+        # Renormalize target logprobs (in probability space)
+        target_probs = torch.exp(target_log_probs) + 1e-8
+        target_probs = target_probs / target_probs.sum(dim=-1, keepdim=True)
+        target_log_probs = torch.log(target_probs)
         
         return target_log_probs
     
+    def _compute_target_value(self, rewards, reward_weights):
+        # We assume each reward function is bounded between -1 and 1
+        min_reward = -1.0 * reward_weights.sum()
+        max_reward = 1.0 * reward_weights.sum()
+        # Split interval (min_reward, max_reward) into len(self.target_tokens) intervals
+        interval_size = (max_reward - min_reward) / len(self.target_tokens)
+        target_values = torch.arange(min_reward, max_reward, interval_size, device=rewards.device)
+
+        # Assign rewards to the closest target value
+        target_value = torch.argmin(torch.abs(rewards.unsqueeze(-1) - target_values), dim=-1)
+
+        return target_value
+    
+    def _compute_value_scalar(self, value, reward_weights):
+        # We assume each reward function is bounded between -1 and 1
+        min_reward = -1.0 * reward_weights.sum()
+        max_reward = 1.0 * reward_weights.sum()
+
+        # Split interval (min_reward, max_reward) into len(self.target_tokens) intervals
+        interval_size = (max_reward - min_reward) / len(self.target_tokens)
+
+        # Convert value to scalar
+        return min_reward + value * interval_size
+    
     def _compute_value_loss(self, log_probs, target_ids):
-        device = log_probs.device
         loss = F.nll_loss(log_probs, target_ids)
         return loss
+    
+    def _compute_advantages_from_critic(self, rewards, value_scalar):
+        advantages = rewards - value_scalar.detach()
+        return advantages
+    
+    def _log_stats(self, stats_dict, mode):
+        super()._log_stats(stats_dict, mode)
+
+        values = stats_dict['values'].float()
+        pred_value_log_probs = stats_dict['pred_value_log_probs'].float()
+
+        self._compute_and_log_stats(
+            data=values,
+            metric_name='values',
+            mode=mode,
+        )
+
+        self._compute_and_log_stats(
+            data=pred_value_log_probs,
+            metric_name='pred_value_log_probs',
+            mode=mode,
+        )
+        
+
+        
+        
+        
+        
 
     

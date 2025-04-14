@@ -7,7 +7,6 @@ import wandb
 from transformers import Trainer
 from accelerate.utils import broadcast_object_list, gather, gather_object
 
-from trl import GRPOTrainer
 from trl.data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template
 from trl.models import unwrap_model_for_generation
 from trl.trainer.utils import (
@@ -15,8 +14,10 @@ from trl.trainer.utils import (
     selective_log_softmax,
 )
 
+from open_r1.modifiable_grpo_trainer import ModifiableGRPOTrainer
 
-class GRPOEntropyTrainer(GRPOTrainer):
+
+class GRPOEntropyTrainer(ModifiableGRPOTrainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._metrics["train_stats"] = defaultdict(list)
@@ -97,7 +98,8 @@ class GRPOEntropyTrainer(GRPOTrainer):
             self.accelerator.process_index * len(prompts),
             (self.accelerator.process_index + 1) * len(prompts),
         )
-        advantages = advantages[process_slice]
+        
+        advantages = gathered_advantages[process_slice]
 
         self._log_stats(
             stats_dict={
