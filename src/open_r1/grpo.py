@@ -43,14 +43,14 @@ from open_r1.rewards import (
     missing_response_penalty,
 )
 from open_r1.utils import get_tokenizer
-from open_r1.utils.callbacks import get_callbacks
+from open_r1.utils.callbacks import AdamStatsLogger, get_callbacks
 from open_r1.utils.wandb_logging import init_wandb_training
 from trl import GRPOTrainer, ModelConfig, ScriptArguments, TrlParser, get_peft_config
 
 from open_r1.grpo_entropy_trainer import GRPOEntropyTrainer
 from open_r1.dr_grpo_trainer import DrGRPOTrainer
 from open_r1.ac_trainer import ActorCriticTrainer
-
+from open_r1.ac_nobaseline import ActorCriticNoBaselineTrainer
 
 logger = logging.getLogger(__name__)
 
@@ -173,12 +173,12 @@ def main(script_args, training_args, model_args):
     logger.info(f"Script parameters {script_args}")
     logger.info(f"Training parameters {training_args}")
 
-    # Check for last checkpoint
-    last_checkpoint = None
-    if os.path.isdir(training_args.output_dir):
-        last_checkpoint = get_last_checkpoint(training_args.output_dir)
-    if last_checkpoint is not None and training_args.resume_from_checkpoint is None:
-        logger.info(f"Checkpoint detected, resuming training at {last_checkpoint=}.")
+    # Check for last checkpoint - disabled by default
+    # last_checkpoint = None
+    # if os.path.isdir(training_args.output_dir):
+    #     last_checkpoint = get_last_checkpoint(training_args.output_dir)
+    # if last_checkpoint is not None and training_args.resume_from_checkpoint is None:
+    #     logger.info(f"Checkpoint detected, resuming training at {last_checkpoint=}.")
 
     if "wandb" in training_args.report_to:
         init_wandb_training(training_args)
@@ -239,6 +239,12 @@ def main(script_args, training_args, model_args):
         if "messages" in dataset[split].column_names:
             dataset[split] = dataset[split].remove_columns("messages")
 
+    # Create a fixed random subset of eval dataset
+    if script_args.dataset_test_split in dataset:
+        # Use a fixed seed for dataset sampling, independent of training seed
+        eval_dataset = dataset[script_args.dataset_test_split].shuffle(seed=42)
+        dataset[script_args.dataset_test_split] = eval_dataset.select(range(int(len(eval_dataset) * training_args.eval_dataset_ratio)))
+
     logger.info("*** Initializing model kwargs ***")
     torch_dtype = (
         model_args.torch_dtype if model_args.torch_dtype in ["auto", None] else getattr(torch, model_args.torch_dtype)
@@ -267,6 +273,10 @@ def main(script_args, training_args, model_args):
         processing_class=tokenizer,
     )
 
+    adam_stats_logger = AdamStatsLogger()
+    trainer.add_callback(adam_stats_logger)
+    adam_stats_logger.trainer = trainer
+
     ###############
     # Training loop
     ###############
@@ -274,8 +284,8 @@ def main(script_args, training_args, model_args):
     checkpoint = None
     if training_args.resume_from_checkpoint is not None:
         checkpoint = training_args.resume_from_checkpoint
-    elif last_checkpoint is not None:
-        checkpoint = last_checkpoint
+    # elif last_checkpoint is not None: # Avoid resuming from last checkpoint by default
+    #     checkpoint = last_checkpoint
     train_result = trainer.train(resume_from_checkpoint=checkpoint)
     metrics = train_result.metrics
     metrics["train_samples"] = len(dataset[script_args.dataset_train_split])
@@ -304,12 +314,13 @@ def main(script_args, training_args, model_args):
     ##########
     # Evaluate
     ##########
-    if training_args.do_eval:
-        logger.info("*** Evaluate ***")
-        metrics = trainer.evaluate()
-        metrics["eval_samples"] = len(dataset[script_args.dataset_test_split])
-        trainer.log_metrics("eval", metrics)
-        trainer.save_metrics("eval", metrics)
+    # Remove for now
+    # if training_args.do_eval:
+    #     logger.info("*** Evaluate ***")
+    #     metrics = trainer.evaluate(eval_dataset=dataset[script_args.dataset_test_split])
+    #     metrics["eval_samples"] = len(dataset[script_args.dataset_test_split])
+    #     trainer.log_metrics("eval", metrics)
+    #     trainer.save_metrics("eval", metrics)
 
     #############
     # push to hub

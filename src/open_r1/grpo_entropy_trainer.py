@@ -1,10 +1,22 @@
 from collections import defaultdict
-from typing import Any, Union
+import time
+from typing import Any, List, Optional, Union
 import torch
 import torch.nn as nn
+import pandas as pd
+import numpy as np
 import wandb
+from tqdm import tqdm
+from packaging import version
+from torch.utils.data import DataLoader, Sampler
 
+
+import transformers
 from transformers import Trainer
+from transformers.integrations.deepspeed import deepspeed_init
+from transformers.trainer_pt_utils import find_batch_size
+from transformers.trainer_utils import EvalLoopOutput, has_length, denumpify_detensorize
+from transformers.utils import logging
 from accelerate.utils import broadcast_object_list, gather, gather_object
 
 from trl.data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template
@@ -14,7 +26,10 @@ from trl.trainer.utils import (
     selective_log_softmax,
 )
 
-from open_r1.modifiable_grpo_trainer import ModifiableGRPOTrainer
+from open_r1.modifiable_grpo_trainer import ModifiableGRPOTrainer, RepeatRandomSampler
+
+
+logger = logging.get_logger(__name__)
 
 
 class GRPOEntropyTrainer(ModifiableGRPOTrainer):
@@ -88,6 +103,10 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
         # completions may be distributed across processes
         rewards_per_func = gather(rewards_per_func)
 
+        # Find index of accuracy reward function
+        accuracy_idx = [i for i, func in enumerate(self.reward_funcs) if func.__name__ == "accuracy_reward"][0]
+        accuracy_reward = rewards_per_func[:, accuracy_idx]
+
         # Apply weights to each reward function's output and sum
         rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).sum(dim=1)
 
@@ -101,7 +120,7 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
         
         advantages = gathered_advantages[process_slice]
 
-        self._log_stats(
+        table = self._log_stats(
             stats_dict={
                 'rewards_per_func': rewards_per_func,
                 'rewards': rewards,
@@ -115,7 +134,7 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
             mode=mode
         )
 
-        return {
+        final_dict = {
             "prompt_ids": prompt_ids,
             "prompt_mask": prompt_mask,
             "completion_ids": completion_ids,
@@ -123,7 +142,14 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
             "old_per_token_logps": old_per_token_logps,
             "ref_per_token_logps": ref_per_token_logps,
             "advantages": advantages,
+            "accuracy_reward": accuracy_reward,
         }
+
+        if table is not None:
+            # merge table and final_dict
+            final_dict['table'] = table
+
+        return final_dict
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         if return_outputs:
@@ -414,42 +440,37 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
 
 
 
-        if self.log_completions and self.state.global_step % self.args.logging_steps == 0:
-            prompts_to_log = gather_object(prompts_text)
-            completions_to_log = gather_object(completions_text)
-            rewards_to_log = rewards.tolist()
+        prompts_to_log = gather_object(prompts_text)
+        completions_to_log = gather_object(completions_text)
+        rewards_to_log = rewards.tolist()
 
+        # For logging
+        table = {
+            "step": [str(self.state.global_step)] * len(rewards),
+            "prompt": prompts_to_log,
+            "completion": completions_to_log,
+            "reward": rewards.tolist(),
+            "correct": correct_responses.tolist(),
+        }
+
+        # Add individual reward function values
+        for i, reward_func in enumerate(self.reward_funcs):
+            if isinstance(reward_func, nn.Module):
+                reward_func_name = reward_func.config._name_or_path.split("/")[-1]
+            else:
+                reward_func_name = reward_func.__name__
+            table[f"reward_{reward_func_name}"] = rewards_per_func[:, i].tolist()
+
+        
+        if self.args.report_to and "wandb" in self.args.report_to and wandb.run is not None:
+            import pandas as pd                    
+            df = pd.DataFrame(table)
+            
             if self.accelerator.is_main_process:
-                # if is_rich_available():
-                    # print_prompt_completions_sample(
-                    #     prompts_to_log,
-                    #     completions_to_log,
-                    #     rewards_to_log,
-                    #     self.state.global_step,
-                    # )
-                if self.args.report_to and "wandb" in self.args.report_to and wandb.run is not None:
-                    import pandas as pd
+                wandb.log({"completions": wandb.Table(dataframe=df)})
 
-                    # For logging
-                    table = {
-                        "step": [str(self.state.global_step)] * len(rewards),
-                        "prompt": prompts_to_log,
-                        "completion": completions_to_log,
-                        "reward": rewards.tolist(),
-                        "correct": correct_responses.tolist(),
-                    }
-
-                    # Add individual reward function values
-                    for i, reward_func in enumerate(self.reward_funcs):
-                        if isinstance(reward_func, nn.Module):
-                            reward_func_name = reward_func.config._name_or_path.split("/")[-1]
-                        else:
-                            reward_func_name = reward_func.__name__
-                        table[f"reward_{reward_func_name}"] = rewards_per_func[:, i].tolist()
-                        
-                    df = pd.DataFrame(table)
-
-                    wandb.log({"completions": wandb.Table(dataframe=df)})
+        return table
+        
     
     def _compute_and_log_stats(self, data, metric_name, mode, groups=None, stats=None):
         """Compute and log statistics for the given data.
@@ -486,3 +507,170 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
                     for stat_name, stat_func in stats.items():
                         metric_key = f"{metric_name}/{group_name}/{stat_name}" if stat_name != 'mean' else f"{metric_name}/{group_name}"
                         self._metrics[mode][metric_key].append(stat_func(group_data))
+
+
+    def evaluation_loop(
+        self,
+        dataloader: DataLoader,
+        description: str,
+        prediction_loss_only: Optional[bool] = None,
+        ignore_keys: Optional[List[str]] = None,
+        metric_key_prefix: str = "eval",
+    ) -> EvalLoopOutput:
+        """
+        Prediction/evaluation loop, shared by `Trainer.evaluate()` and `Trainer.predict()`.
+        Works both with or without labels.
+        """
+        args = self.args
+
+        prediction_loss_only = prediction_loss_only if prediction_loss_only is not None else args.prediction_loss_only
+
+        # if eval is called w/o train, handle model prep here
+        if self.is_deepspeed_enabled and self.deepspeed is None:
+            _, _ = deepspeed_init(self, num_training_steps=0, inference=True)
+
+        model = self._wrap_model(self.model, training=False, dataloader=dataloader)
+
+        if len(self.accelerator._models) == 0 and model is self.model:
+            start_time = time.time()
+            model = (
+                self.accelerator.prepare(model)
+                if self.is_deepspeed_enabled or (self.is_fsdp_enabled and self.accelerator.mixed_precision != "fp8")
+                else self.accelerator.prepare_model(model, evaluation_mode=True)
+            )
+            self.model_preparation_time = round(time.time() - start_time, 4)
+
+            if self.is_fsdp_enabled:
+                self.model = model
+
+            # for the rest of this function `model` is the outside model, whether it was wrapped or not
+            if model is not self.model:
+                self.model_wrapped = model
+
+            # backward compatibility
+            if self.is_deepspeed_enabled:
+                self.deepspeed = self.model_wrapped
+
+        # if full fp16 or bf16 eval is wanted and this ``evaluation`` or ``predict`` isn't called
+        # while ``train`` is running, cast it to the right dtype first and then put on device
+        if not self.is_in_train:
+            if args.fp16_full_eval:
+                model = model.to(dtype=torch.float16, device=args.device)
+            elif args.bf16_full_eval:
+                model = model.to(dtype=torch.bfloat16, device=args.device)
+
+        batch_size = self.args.eval_batch_size
+
+        logger.info(f"\n***** Running {description} *****")
+        if has_length(dataloader):
+            logger.info(f"  Num examples = {self.num_examples(dataloader)}")
+        else:
+            logger.info("  Num examples: Unknown")
+        logger.info(f"  Batch size = {batch_size}")
+
+        model.eval()
+        if hasattr(self.optimizer, "eval") and callable(self.optimizer.eval):
+            self.optimizer.eval()
+
+        self.callback_handler.eval_dataloader = dataloader
+        metrics = {}
+        observed_num_examples = 0
+
+        # Initialize lists to collect data across all processes
+        all_tables = []
+        all_accuracy_rewards = []
+
+        with torch.no_grad():
+            for step, inputs in tqdm(
+                enumerate(dataloader),
+                desc="Evaluation",
+                disable=not self.accelerator.is_local_main_process,
+                total=len(dataloader) if hasattr(dataloader, "__len__") else None
+            ):
+                # Update observed examples count
+                observed_batch_size = find_batch_size(inputs)
+                if observed_batch_size is not None:
+                    observed_num_examples += observed_batch_size
+                    if batch_size is None:
+                        batch_size = observed_batch_size
+
+                # Prediction step
+                step_metrics = self._prepare_inputs(inputs)
+                
+                # Collect tables and accuracy rewards
+                if 'table' in step_metrics:
+                    all_tables.append(step_metrics['table'])
+                all_accuracy_rewards.extend(step_metrics['accuracy_reward'].tolist())
+
+            # Gather data from all processes
+            gathered_tables = gather_object(all_tables)
+            gathered_accuracy_rewards = self.accelerator.gather_for_metrics(
+                torch.tensor(all_accuracy_rewards, device=self.accelerator.device)
+            )
+
+            # Handle single GPU case
+            if not isinstance(gathered_tables, list):
+                gathered_tables = [gathered_tables]
+
+            # Process gathered data on main process
+            if self.accelerator.is_main_process:
+                # Flatten the gathered tables
+                full_table = {}
+                for tables in gathered_tables:
+                    # Handle case where tables might be a single dict instead of a list
+                    tables_list = tables if isinstance(tables, list) else [tables]
+                    for table in tables_list:
+                        for key, values in table.items():
+                            if key in full_table:
+                                full_table[key].extend(values)
+                            else:
+                                full_table[key] = list(values)
+
+                # Log to wandb
+                if self.args.report_to and "wandb" in self.args.report_to and wandb.run is not None:
+                    df = pd.DataFrame(full_table)
+                    wandb.log({"eval_set_completions": wandb.Table(dataframe=df)})
+
+            # Log the length of accuracy rewards per GPU and total
+            logger.info(f"Total Length of accuracy rewards: {gathered_accuracy_rewards.shape}")
+
+            # Compute metrics using gathered rewards
+            metrics['eval_accuracy_reward'] = gathered_accuracy_rewards.mean().item()
+
+        torch.cuda.empty_cache()
+        return EvalLoopOutput(
+            metrics=metrics,
+            predictions=None,
+            label_ids=None,
+            num_samples=observed_num_examples
+        )
+    
+
+    def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
+        mode = "eval" if self._metrics.get('eval') and self._metrics['eval'] else "train"
+        metrics = {key: sum(val) / len(val) for key, val in self._metrics[mode].items()}  # average the metrics
+
+        # This method can be called both in training and evaluation. When called in evaluation, the keys in `logs`
+        # start with "eval_". We need to add the prefix "eval_" to the keys in `metrics` to match the format.
+        if mode == "eval":
+            metrics = {f"eval_{key}": val for key, val in metrics.items()}
+
+        # Move any adam_stats metrics to the main metrics dict
+        for key, value in self._metrics.items():
+            if key.startswith('adam_stats/'):
+                metrics[key] = value
+
+        logs = {**logs, **metrics}
+        if version.parse(transformers.__version__) >= version.parse("4.47.0.dev0"):
+            Trainer.log(self, logs, start_time)
+        else:  # transformers<=4.46
+            Trainer.log(self, logs)
+        self._metrics[mode].clear()
+
+    def _get_eval_sampler(self, eval_dataset) -> Sampler:
+        # See _get_train_sampler for an explanation of the sampler.
+        return RepeatRandomSampler(
+            data_source=eval_dataset,
+            mini_repeat_count=1, # No repeats for evaluation
+            seed=self.args.seed,
+        )

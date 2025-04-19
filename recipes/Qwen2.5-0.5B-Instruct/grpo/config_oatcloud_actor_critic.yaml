@@ -16,7 +16,12 @@ vllm_device: auto
 vllm_gpu_memory_utilization: 0.25
 do_eval: true
 eval_strategy: steps
-eval_steps: 100
+eval_steps: 1
+save_strategy: steps
+save_steps: 1
+eval_dataset_ratio: 0.005
+load_best_model_at_end: true
+metric_for_best_model: accuracy_reward
 gradient_accumulation_steps: 1
 gradient_checkpointing: true
 gradient_checkpointing_kwargs:
@@ -59,7 +64,6 @@ reward_weights:
 - 0.0
 - 0.0
 - 0.0
-save_strategy: "no"
 seed: 42
 warmup_ratio: 0.1
 beta: 0.0

@@ -20,6 +20,7 @@ from typing import List
 from transformers import TrainerCallback
 from transformers.trainer_callback import TrainerControl, TrainerState
 from transformers.training_args import TrainingArguments
+import wandb
 
 from .evaluation import run_benchmark_jobs
 from .hub import push_to_hub_revision
@@ -69,6 +70,60 @@ class PushToHubRevisionCallback(TrainerCallback):
                     run_benchmark_jobs(dummy_config, self.model_config)
 
                 future.add_done_callback(run_benchmark_callback)
+
+from transformers import TrainerCallback
+import wandb
+import torch
+
+class AdamStatsLogger(TrainerCallback):
+    def __init__(self):
+        self.trainer = None
+
+    def on_step_end(self, args, state, control, model=None, optimizer=None, **kwargs):
+        if not control.should_log or self.trainer is None:
+            return
+
+        optimizer = self.trainer.optimizer
+        eps = optimizer.param_groups[0]["eps"]
+
+        m_vals = []
+        v_vals = []
+        effective_lrs = []
+
+        for group in optimizer.param_groups:
+            lr = group["lr"]
+            for param in group["params"]:
+                if param.grad is None or param not in optimizer.state:
+                    continue
+
+                state_dict = optimizer.state[param]
+                m = state_dict.get("exp_avg", None)
+                v = state_dict.get("exp_avg_sq", None)
+
+                if m is not None and v is not None:
+                    # Adam's effective learning rate: lr * m_t / (sqrt(v_t) + eps)
+                    effective_lr = (lr * m / (v.sqrt() + eps)).detach().flatten()
+                    m_vals.append(m.detach().flatten())
+                    v_vals.append(v.detach().flatten())
+                    effective_lrs.append(effective_lr)
+
+        if not m_vals:
+            return  # nothing to log
+
+        m_cat = torch.cat(m_vals)
+        v_cat = torch.cat(v_vals)
+        effective_lrs_cat = torch.cat(effective_lrs)
+
+        # Log the stats: min, max, mean for moments and effective learning rates
+        self.trainer._metrics["adam_stats/m_t_mean"] = m_cat.mean().item()
+        self.trainer._metrics["adam_stats/m_t_min"] = m_cat.min().item()
+        self.trainer._metrics["adam_stats/m_t_max"] = m_cat.max().item()
+        self.trainer._metrics["adam_stats/v_t_mean"] = v_cat.mean().item()
+        self.trainer._metrics["adam_stats/v_t_min"] = v_cat.min().item()
+        self.trainer._metrics["adam_stats/v_t_max"] = v_cat.max().item()
+        self.trainer._metrics["adam_stats/lr_effective_mean"] = effective_lrs_cat.mean().item()
+        self.trainer._metrics["adam_stats/lr_effective_min"] = effective_lrs_cat.min().item()
+        self.trainer._metrics["adam_stats/lr_effective_max"] = effective_lrs_cat.max().item()
 
 
 CALLBACKS = {

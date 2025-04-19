@@ -50,6 +50,10 @@ class GRPOConfig(trl.GRPOConfig):
         default=None,
         metadata={"help": ("The project to store runs under.")},
     )
+    eval_dataset_ratio: Optional[int] = field(
+        default=1.0,
+        metadata={"help": "The ratio of the eval dataset to use for evaluation."},
+    )
 
 
 @dataclass

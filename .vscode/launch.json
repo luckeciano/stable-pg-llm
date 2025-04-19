@@ -2,12 +2,14 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Debug R1 Training",
+            "name": "Debug R1 Training with Accelerate",
             "type": "debugpy",
             "request": "launch",
-            "program": "src/open_r1/grpo.py",
+            "module": "accelerate.commands.launch",
             "args": [
-                "--config", "recipes/Qwen2.5-0.5B-Instruct/grpo/config_oatcloud_token_entropy.yaml"
+                "--config_file", "recipes/accelerate_configs/zero2_debug.yaml",
+                "src/open_r1/grpo.py",
+                "--config", "recipes/Qwen2.5-0.5B-Instruct/grpo/config_oatcloud_actor_critic.yaml"
             ],
             "console": "integratedTerminal",
             "justMyCode": false,
