@@ -451,6 +451,7 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
             "completion": completions_to_log,
             "reward": rewards.tolist(),
             "correct": correct_responses.tolist(),
+            "advantages": advantages.tolist(),
         }
 
         # Add individual reward function values

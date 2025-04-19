@@ -57,9 +57,7 @@ class ActorCriticTrainer(GRPOEntropyTrainer):
 
         target_value = self._compute_target_value(rewards, self.reward_weights)
 
-        value_scalar = self._compute_value_scalar(target_value, self.reward_weights)
-
-        advantages = self._compute_advantages_from_critic(rewards, value_scalar)
+        advantages = self._compute_advantages_from_critic(rewards, values)
 
         table = self._log_stats(
             stats_dict={
@@ -139,9 +137,7 @@ class ActorCriticTrainer(GRPOEntropyTrainer):
         values_log_probs = self._compute_next_token_logits(prompt_ids, prompt_mask, device)
 
         # Select the target value token
-        values = values_log_probs.argmax(dim=-1)
-        # Target value logprobs - gather along second dimension using values indices and squeeze to get 1D tensor
-        pred_value_log_probs = torch.gather(values_log_probs, dim=1, index=values.unsqueeze(-1)).squeeze(-1)
+        values, pred_value_log_probs = self._infer_values(values_log_probs)
 
         return values, values_log_probs, pred_value_log_probs
     
@@ -164,12 +160,30 @@ class ActorCriticTrainer(GRPOEntropyTrainer):
         
         return target_log_probs
     
+    def _infer_values(self, log_probs, type="marginalization"):
+        min_reward, max_reward = self._compute_reward_interval(self.reward_weights)
+        # Split interval [min_reward, max_reward] into len(self.target_tokens) intervals
+        interval_size = (max_reward - min_reward) / (len(self.target_tokens) - 1)
+        possible_values = min_reward + torch.arange(len(self.target_tokens), device=log_probs.device) * interval_size
+        
+        mode_values = log_probs.argmax(dim=-1)
+        pred_value_log_probs = torch.gather(log_probs, dim=1, index=mode_values.unsqueeze(-1)).squeeze(-1)
+        if type == "mode":
+            values = min_reward + mode_values * interval_size
+            return values, pred_value_log_probs
+        
+        elif type == "marginalization":
+            # Compute marginalization
+            values_per_prob = torch.exp(log_probs) * possible_values
+            inferred_values = torch.sum(values_per_prob, dim=-1)
+            return inferred_values, pred_value_log_probs
+
+    
     def _compute_target_value(self, rewards, reward_weights):
-        # We assume each reward function is bounded between -1 and 1
-        min_reward = -1.0 * reward_weights.sum()
-        max_reward = 1.0 * reward_weights.sum()
-        # Split interval (min_reward, max_reward) into len(self.target_tokens) intervals
-        interval_size = (max_reward - min_reward) / len(self.target_tokens)
+        min_reward, max_reward = self._compute_reward_interval(reward_weights)
+        
+        # Split interval [min_reward, max_reward] into len(self.target_tokens) intervals
+        interval_size = (max_reward - min_reward) / (len(self.target_tokens) - 1)
         target_values = torch.arange(min_reward, max_reward, interval_size, device=rewards.device)
 
         # Assign rewards to the closest target value
@@ -178,12 +192,10 @@ class ActorCriticTrainer(GRPOEntropyTrainer):
         return target_value
     
     def _compute_value_scalar(self, value, reward_weights):
-        # We assume each reward function is bounded between -1 and 1
-        min_reward = -1.0 * reward_weights.sum()
-        max_reward = 1.0 * reward_weights.sum()
+        min_reward, max_reward = self._compute_reward_interval(reward_weights)
 
         # Split interval (min_reward, max_reward) into len(self.target_tokens) intervals
-        interval_size = (max_reward - min_reward) / len(self.target_tokens)
+        interval_size = (max_reward - min_reward) / (len(self.target_tokens) - 1)
 
         # Convert value to scalar
         return min_reward + value * interval_size
@@ -236,6 +248,11 @@ class ActorCriticTrainer(GRPOEntropyTrainer):
 
         return loss
 
+    def _compute_reward_interval(self, reward_weights):
+        # We assume each reward function is bounded between -1 and 1
+        min_reward = -1.0 * reward_weights.sum()
+        max_reward = 1.0 * reward_weights.sum()
+        return min_reward, max_reward
     
     def _compute_advantages_from_critic(self, rewards, value_scalar):
         advantages = rewards - value_scalar.detach()
