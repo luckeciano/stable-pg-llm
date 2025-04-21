@@ -12,8 +12,9 @@ class ActorCriticTrainer(GRPOEntropyTrainer):
     """
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.target_tokens = [f"<VF_{i}>" for i in range(10)]
-        self.processing_class.add_tokens(self.target_tokens)
+        # self.target_tokens = [f"<VF_{i}>" for i in range(10)]
+        # self.processing_class.add_tokens(self.target_tokens)
+        self.target_tokens = [f"{i}" for i in range(1, 6)]
 
     
     def _generate_and_score_completions(
@@ -85,7 +86,7 @@ class ActorCriticTrainer(GRPOEntropyTrainer):
             "advantages": advantages,
             "values_log_probs": values_log_probs,
             "target_value": target_value,
-            "accuracy_reward": accuracy_reward,
+            "accuracy_reward": self.accelerator.gather(accuracy_reward),
         }
 
         if table is not None:
@@ -115,7 +116,7 @@ class ActorCriticTrainer(GRPOEntropyTrainer):
     
     # Format into conversation
     def _make_critic_inputs(self, inputs):
-        critic_prompt = "<VALUE_TASK>"
+        critic_prompt = "Analyze the following problem carefully and provide a value function prediction between 1 and 5. 1 is minimum value, 5 is maximum value. 3 is the midpoint and means zero reward."
         critic_inputs = deepcopy(inputs)
         for input in critic_inputs:
             prompt = []
@@ -264,13 +265,13 @@ class ActorCriticTrainer(GRPOEntropyTrainer):
         values = stats_dict['values'].float()
         pred_value_log_probs = stats_dict['pred_value_log_probs'].float()
 
-        self._compute_and_log_stats(
+        self._accumulate_stats(
             data=values,
             metric_name='values',
             mode=mode,
         )
 
-        self._compute_and_log_stats(
+        self._accumulate_stats(
             data=pred_value_log_probs,
             metric_name='pred_value_log_probs',
             mode=mode,

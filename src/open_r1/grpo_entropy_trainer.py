@@ -35,8 +35,10 @@ logger = logging.get_logger(__name__)
 class GRPOEntropyTrainer(ModifiableGRPOTrainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._metrics["train_stats"] = defaultdict(list)
-        self._metrics["eval_stats"] = defaultdict(list)
+        self._metrics["num_completions_train"] = []
+        self._metrics["num_completions_eval"] = []
+        self._metrics["generated_tokens_train"] = []
+        self._metrics["generated_tokens_eval"] = []
 
     def _get_per_token_logps(self, model, input_ids, attention_mask, logits_to_keep, return_hidden_states=False):
         """Get per-token log probabilities and embeddings from the model.
@@ -363,16 +365,19 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
 
         return rewards_per_func, correct_responses
     
-    def _compute_advantages(self, rewards, mode):  
+    def _compute_advantages(self, rewards, mode):
+        if mode == "eval" or self.num_generations == 1:
+            logger.warning("Evaluation or num_generations = 1, returning rewards as advantages")
+            return rewards
+        
         mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
         std_grouped_rewards = rewards.view(-1, self.num_generations).std(dim=1) 
 
-        self._metrics[mode]["reward_std"].append(std_grouped_rewards.mean().item())
-
-        self._compute_and_log_stats(
+        self._accumulate_stats(
             data=std_grouped_rewards,
             metric_name='grouped_std_rewards',
             mode=mode,
+            stats={'mean': lambda x: x.mean().item()},
         )
 
         # Normalize the rewards to compute the advantages
@@ -398,8 +403,15 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
         completion_length = self.accelerator.gather(completion_mask.sum(1)).float()
         correct_responses = self.accelerator.gather(correct_responses)
 
+        num_generation_tokens = completion_length.sum()
+        self._metrics[f"generated_tokens_{mode}"].append(num_generation_tokens.item())
+        self._metrics[f"num_completions_{mode}"].append(completion_length.shape[0])
+
+        self._metrics[mode]["num_completions"] = (torch.tensor(sum(self._metrics[f"num_completions_{mode}"]), device=self.accelerator.device), {'total': lambda x: x.item()})
+        self._metrics[mode]["generated_tokens"] = (torch.tensor(sum(self._metrics[f"generated_tokens_{mode}"]), device=self.accelerator.device), {'total': lambda x: x.item()})
+
         # Log advantages
-        self._compute_and_log_stats(
+        self._accumulate_stats(
             data=advantages,
             metric_name='advantages',
             mode=mode,
@@ -407,38 +419,46 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
 
         # Log stats for each reward function
         for i, reward_func in enumerate(self.reward_funcs):
-            self._compute_and_log_stats(
+            self._accumulate_stats(
                 data=rewards_per_func[:, i],
                 metric_name=reward_func.__name__,
                 mode=mode,
                 groups={'correct': correct_responses, 'incorrect': ~correct_responses},
             )
 
-        self._compute_and_log_stats(
+        self._accumulate_stats(
             data=completion_length,
             metric_name='completion_length',
             mode=mode,
             groups={'correct': correct_responses, 'incorrect': ~correct_responses},
         )
 
-        reward_per_func = rewards_per_func.mean(0)
         for i, reward_func in enumerate(self.reward_funcs):
             if isinstance(reward_func, nn.Module):  # Module instead of PretrainedModel for compat with compiled models
                 reward_func_name = reward_func.config._name_or_path.split("/")[-1]
             else:
                 reward_func_name = reward_func.__name__
-            self._metrics[mode][f"rewards/{reward_func_name}"].append(reward_per_func[i].item())
+            self._accumulate_stats(
+                data=rewards_per_func[:, i],
+                metric_name=f"rewards/{reward_func_name}",
+                mode=mode,
+            )
 
-        self._metrics[mode]["reward"].append(rewards.mean().item())
+        self._accumulate_stats(
+            data=rewards,
+            metric_name="reward",
+            mode=mode,
+        )
 
         # save logprobs to wandb
         if old_per_token_logps is not None:
-            mean_logprobs = self.accelerator.gather_for_metrics(old_per_token_logps.mean(1)).float().mean().item()
-            sum_logprobs = self.accelerator.gather_for_metrics(old_per_token_logps.sum(1)).float().mean().item()
-            self._metrics[mode]["logprobs/mean"].append(mean_logprobs)
-            self._metrics[mode]["logprobs/sum"].append(sum_logprobs)
-
-
+            logprobs = self.accelerator.gather_for_metrics(old_per_token_logps.mean(1))
+            self._accumulate_stats(
+                data=logprobs,
+                metric_name='mean_logprobs',
+                mode=mode,
+                stats={'mean': lambda x: x.mean().item()},
+            )
 
         prompts_to_log = gather_object(prompts_text)
         completions_to_log = gather_object(completions_text)
@@ -451,7 +471,6 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
             "completion": completions_to_log,
             "reward": rewards.tolist(),
             "correct": correct_responses.tolist(),
-            "advantages": advantages.tolist(),
         }
 
         # Add individual reward function values
@@ -472,17 +491,14 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
 
         return table
         
-    
-    def _compute_and_log_stats(self, data, metric_name, mode, groups=None, stats=None):
-        """Compute and log statistics for the given data.
+    def _accumulate_stats(self, data, metric_name, mode, groups=None, stats=None):
+        """Accumulate statistics for the given data.
         
         Args:
             data (torch.Tensor): Tensor containing the data to analyze
             metric_name (str): Base name for the metric (e.g. 'completion_length')
             mode (str): Either "train" or "eval"
             groups (dict, optional): Dictionary mapping group names to boolean masks for data grouping
-            stats (dict, optional): Dictionary mapping stat names to computation functions.
-                                  Defaults to mean, max, min, p25, p75, median
         """
         # Default statistics if none provided
         if stats is None:
@@ -495,21 +511,43 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
                 'median': lambda x: x.median().item()
             }
         
-        # Compute and log overall statistics
-        for stat_name, stat_func in stats.items():
-            metric_key = f"{metric_name}/{stat_name}" if stat_name != 'mean' else metric_name
-            self._metrics[mode][metric_key].append(stat_func(data))
-        
-        # If groups are provided, compute statistics for each group
+        # Save data in metrics dictionary, grouped by mode and groups
+        # If metric_name is not in metrics, create it
+        if metric_name not in self._metrics[mode]:
+            self._metrics[mode][metric_name] = (data, stats)
+        else:
+            self._metrics[mode][metric_name] = (torch.cat([self._metrics[mode][metric_name][0], data]), stats)
+
         if groups is not None:
             for group_name, mask in groups.items():
-                group_data = data[mask]
-                if len(group_data) > 0:  # Only compute stats if group has data
-                    for stat_name, stat_func in stats.items():
-                        metric_key = f"{metric_name}/{group_name}/{stat_name}" if stat_name != 'mean' else f"{metric_name}/{group_name}"
-                        self._metrics[mode][metric_key].append(stat_func(group_data))
+                if f"{metric_name}/{group_name}" not in self._metrics[mode]:
+                    self._metrics[mode][f"{metric_name}/{group_name}"] = (data[mask], stats)
+                else:
+                    self._metrics[mode][f"{metric_name}/{group_name}"] = (torch.cat([self._metrics[mode][f"{metric_name}/{group_name}"][0], data[mask]]), stats)
+        
+    def _compute_and_log_stats(self, data, metric_name, mode, stats):
+        """Compute and log statistics for the given data.
+        
+        Args:
+            data (torch.Tensor): Tensor containing the data to analyze
+            metric_name (str): Base name for the metric (e.g. 'completion_length')
+            mode (str): Either "train" or "eval"
+            groups (dict, optional): Dictionary mapping group names to boolean masks for data grouping
+            stats (dict, optional): Dictionary mapping stat names to computation functions.
+                                  Defaults to mean, max, min, p25, p75, median
+        """        
+        # Skip empty data
+        if data.numel() == 0:
+            return {}
+            
+        # Compute and log overall statistics
+        metrics = {}
+        for stat_name, stat_func in stats.items():
+            metric_key = f"{metric_name}/{stat_name}" if stat_name != 'mean' else f"{metric_name}"
+            metrics[metric_key] = stat_func(data)
 
-
+        return metrics
+    
     def evaluation_loop(
         self,
         dataloader: DataLoader,
@@ -601,15 +639,13 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
                 # Collect tables and accuracy rewards
                 if 'table' in step_metrics:
                     all_tables.append(step_metrics['table'])
-                all_accuracy_rewards.extend(step_metrics['accuracy_reward'].tolist())
+                all_accuracy_rewards.append(step_metrics['accuracy_reward'])
 
             # Gather data from all processes
             gathered_tables = gather_object(all_tables)
-            gathered_accuracy_rewards = self.accelerator.gather_for_metrics(
-                torch.tensor(all_accuracy_rewards, device=self.accelerator.device)
-            )
-
-            # Handle single GPU case
+            gathered_accuracy_rewards = torch.cat(all_accuracy_rewards)
+            
+            # Handle single GPU case where gather returns a single tensor instead of a list
             if not isinstance(gathered_tables, list):
                 gathered_tables = [gathered_tables]
 
@@ -633,7 +669,7 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
                     wandb.log({"eval_set_completions": wandb.Table(dataframe=df)})
 
             # Log the length of accuracy rewards per GPU and total
-            logger.info(f"Total Length of accuracy rewards: {gathered_accuracy_rewards.shape}")
+            logger.info(f"TotalLength of accuracy rewards: {gathered_accuracy_rewards.shape}")
 
             # Compute metrics using gathered rewards
             metrics['eval_accuracy_reward'] = gathered_accuracy_rewards.mean().item()
@@ -649,7 +685,13 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
 
     def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
         mode = "eval" if self._metrics.get('eval') and self._metrics['eval'] else "train"
-        metrics = {key: sum(val) / len(val) for key, val in self._metrics[mode].items()}  # average the metrics
+
+        metrics = {}
+        for key, val in self._metrics[mode].items():
+            if isinstance(val, tuple) and len(val) == 2:
+                metrics.update(self._compute_and_log_stats(val[0], key, mode, val[1]))
+            else:
+                metrics.update({key: sum(val) / len(val)})  # average the metrics
 
         # This method can be called both in training and evaluation. When called in evaluation, the keys in `logs`
         # start with "eval_". We need to add the prefix "eval_" to the keys in `metrics` to match the format.
