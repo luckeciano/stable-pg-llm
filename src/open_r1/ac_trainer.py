@@ -12,9 +12,26 @@ class ActorCriticTrainer(GRPOEntropyTrainer):
     """
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # self.target_tokens = [f"<VF_{i}>" for i in range(10)]
-        # self.processing_class.add_tokens(self.target_tokens)
-        self.target_tokens = [f"{i}" for i in range(1, 6)]
+        self.num_value_tokens = kwargs['args'].num_value_tokens
+        self.value_type = kwargs['args'].value_type
+        self.value_inference_strategy = kwargs['args'].value_inference_strategy
+
+        if self.num_value_tokens % 2 == 0:
+                raise ValueError(f"num_value_tokens must be odd for digit value type.")
+        
+        if self.value_type == "digit":
+            if self.num_value_tokens >= 10 and self.num_value_tokens > 1:
+                raise ValueError(f"num_value_tokens must be less than 10 and greater than 1 for digit value type.")  
+            self.target_tokens = [f"{i}" for i in range(1, self.num_value_tokens + 1)]
+            self.critic_prompt = f"Analyze the following problem carefully and provide a value function prediction between 1 and {self.num_value_tokens}. 1 is minimum value, {self.num_value_tokens} is maximum value. {self.num_value_tokens // 2} is the midpoint and means zero reward."
+        elif self.value_type == "token":
+            self.target_tokens = [f"<VF_{i}>" for i in range(1, self.num_value_tokens + 1)]
+            self.processing_class.add_tokens(self.target_tokens)
+            self.critic_prompt = f"Analyze the following problem carefully and provide a value function prediction between <VF_1> and <VF_{self.num_value_tokens}>. <VF_1> is minimum value, <VF_{self.num_value_tokens}> is maximum value. <VF_{self.num_value_tokens // 2}> is the midpoint and means zero reward."
+        else:
+            raise ValueError(f"Invalid value type: {self.value_type}")
+        
+        self.target_ids = torch.tensor([self.processing_class.convert_tokens_to_ids(token) for token in self.target_tokens], device=self.accelerator.device)
 
     
     def _generate_and_score_completions(
@@ -116,11 +133,10 @@ class ActorCriticTrainer(GRPOEntropyTrainer):
     
     # Format into conversation
     def _make_critic_inputs(self, inputs):
-        critic_prompt = "Analyze the following problem carefully and provide a value function prediction between 1 and 5. 1 is minimum value, 5 is maximum value. 3 is the midpoint and means zero reward."
         critic_inputs = deepcopy(inputs)
         for input in critic_inputs:
             prompt = []
-            prompt.append({"role": "system", "content": critic_prompt})
+            prompt.append({"role": "system", "content": self.critic_prompt})
             prompt.append({"role": "user", "content": input["problem"] + "\n\nVALUE: "})
             input["prompt"] = prompt
         return critic_inputs
@@ -138,7 +154,7 @@ class ActorCriticTrainer(GRPOEntropyTrainer):
         values_log_probs = self._compute_next_token_logits(prompt_ids, prompt_mask, device)
 
         # Select the target value token
-        values, pred_value_log_probs = self._infer_values(values_log_probs)
+        values, pred_value_log_probs = self._infer_values(values_log_probs, self.value_inference_strategy)
 
         return values, values_log_probs, pred_value_log_probs
     
@@ -149,13 +165,11 @@ class ActorCriticTrainer(GRPOEntropyTrainer):
         logits = outputs.logits  # Shape: (batch_size, seq_length, vocab_size)
         # Get indices of the last non-padding tokens in each sequence
         last_token_indices = attention_mask.sum(dim=1) - 1  # Subtract 1 to get last token index
-
-        target_ids = torch.tensor([self.processing_class.convert_tokens_to_ids(token) for token in self.target_tokens], device=device)
         
         # Gather logits for the last tokens of each sequence
         batch_indices = torch.arange(logits.size(0), device=device)
         last_token_logits = logits[batch_indices, last_token_indices, :]
-        target_logits = last_token_logits[:, target_ids]
+        target_logits = last_token_logits[:, self.target_ids]
 
         target_log_probs = F.log_softmax(target_logits, dim=-1)  # Convert logits to log probabilities
         
@@ -178,6 +192,8 @@ class ActorCriticTrainer(GRPOEntropyTrainer):
             values_per_prob = torch.exp(log_probs) * possible_values
             inferred_values = torch.sum(values_per_prob, dim=-1)
             return inferred_values, pred_value_log_probs
+        else:
+            raise ValueError(f"Invalid value inference strategy: {type}")
 
     
     def _compute_target_value(self, rewards, reward_weights):

@@ -55,6 +55,12 @@ class GRPOConfig(trl.GRPOConfig):
         metadata={"help": "The ratio of the eval dataset to use for evaluation."},
     )
 
+    # Actor-Critic
+    num_value_tokens: int = field(default=5, metadata={"help": "The number of value tokens to use."})
+    value_type: str = field(default="digit", metadata={"help": "The type of value tokens to use. Possible values: digit, token."})
+    value_inference_strategy: str = field(default="marginalization", metadata={"help": "The strategy to use for value inference. Possible values: marginalization, mode."})
+
+
 
 @dataclass
 class SFTConfig(trl.SFTConfig):
