@@ -14,7 +14,7 @@ bf16: true
 use_vllm: false
 vllm_device: auto
 vllm_gpu_memory_utilization: 0.7
-do_eval: false
+do_eval: false # TODO
 eval_strategy: steps
 eval_steps: 1
 save_strategy: steps
@@ -27,7 +27,7 @@ gradient_accumulation_steps: 2
 gradient_checkpointing: true
 gradient_checkpointing_kwargs:
   use_reentrant: false
-hub_model_id: Qwen-2.5-7B-RL-Baseline-2-1e-05-24
+hub_model_id: Qwen-2.5-7B-RL-LACPO-NoBaselineNoKLNoEntropy0.5NoSmooth
 hub_strategy: every_save
 learning_rate: 1.0e-05
 log_completions: true
@@ -38,10 +38,11 @@ logging_strategy: steps
 lr_scheduler_type: cosine
 max_prompt_length: 512
 max_completion_length: 1024
+max_grad_norm: 1.0
 max_steps: -1
-num_generations: 8
+num_generations: 1
 num_train_epochs: 1
-output_dir: /scratch-ssd/lucelo/max-ent-llms/data/Qwen-2.5-7B-RL-Baseline-2-1e-05-24
+output_dir: /scratch-ssd/lucelo/max-ent-llms/data/Qwen-2.5-7B-RL-LACPO-NoBaselineNoKLNoEntropy0.5NoSmooth
 overwrite_output_dir: true
 per_device_eval_batch_size: 25 # Keep it 25 to evenly divide by GPUs and not mess up gather
 per_device_train_batch_size: 24
@@ -71,3 +72,14 @@ seed: 42
 warmup_ratio: 0.1
 wandb_project: 'MaxEntLLMs'
 wandb_entity: 'max-ent-llms'
+trainer: ActorCriticNoBaselineTrainer # No Baseline
+softplus_alpha: 0.0 # No Smooth
+entropy_alpha: 0.5 # Entropy
+beta: 0.0 # No KL
+
+# Actor-Critic trainer config
+num_value_tokens: 5
+value_type: digit
+value_inference_strategy: marginalization
+value_loss_weight: 0.00
+normalize_advantages: false

@@ -38,11 +38,14 @@ lr_scheduler_type: cosine
 max_prompt_length: 512
 max_completion_length: 1024
 max_steps: -1
-num_generations: 1
+smooth_logprobs: true
+softplus_alpha: 10.0
+entropy_alpha: 0.1
+num_generations: 2
 num_train_epochs: 1
 output_dir: data/Qwen-2.5-0.5B-Instruct-AC-RL
 overwrite_output_dir: true
-per_device_eval_batch_size: 4
+per_device_eval_batch_size: 5
 per_device_train_batch_size: 4
 push_to_hub: true
 report_to:
@@ -52,7 +55,7 @@ reward_funcs:
 - format
 - answer_logprob
 - missing_response
-- embedding_entropy
+# - embedding_entropy
 token_entropy_reduction: mean
 embedding_entropy_reduction: mean # use pca? (mean, max, sum)
 embedding_entropy_similarity: cosine # cosine, (pairwise similarity)
@@ -63,8 +66,13 @@ reward_weights:
 - 1.0
 - 0.0
 - 0.0
-- 0.0
+# - 0.0
 seed: 42
 warmup_ratio: 0.1
 beta: 0.0
-trainer: ActorCriticTrainer
+trainer: ActorCriticNoBaselineTrainer
+num_value_tokens: 5
+value_type: digit
+value_inference_strategy: marginalization
+value_loss_weight: 0.0
+normalize_advantages: true

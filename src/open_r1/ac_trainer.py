@@ -15,7 +15,9 @@ class ActorCriticTrainer(GRPOEntropyTrainer):
         self.num_value_tokens = kwargs['args'].num_value_tokens
         self.value_type = kwargs['args'].value_type
         self.value_inference_strategy = kwargs['args'].value_inference_strategy
-
+        self.value_loss_weight = kwargs['args'].value_loss_weight
+        self.normalize_advantages = kwargs['args'].normalize_advantages
+        
         if self.num_value_tokens % 2 == 0:
                 raise ValueError(f"num_value_tokens must be odd for digit value type.")
         
@@ -27,6 +29,8 @@ class ActorCriticTrainer(GRPOEntropyTrainer):
         elif self.value_type == "token":
             self.target_tokens = [f"<VF_{i}>" for i in range(1, self.num_value_tokens + 1)]
             self.processing_class.add_tokens(self.target_tokens)
+            # Resize token embeddings
+            # self.model.resize_token_embeddings(len(self.processing_class))
             self.critic_prompt = f"Analyze the following problem carefully and provide a value function prediction between <VF_1> and <VF_{self.num_value_tokens}>. <VF_1> is minimum value, <VF_{self.num_value_tokens}> is maximum value. <VF_{self.num_value_tokens // 2}> is the midpoint and means zero reward."
         else:
             raise ValueError(f"Invalid value type: {self.value_type}")
@@ -124,12 +128,8 @@ class ActorCriticTrainer(GRPOEntropyTrainer):
         mode = "eval" if self.control.should_evaluate else "train"
         self._metrics[mode]["value_loss"].append(self.accelerator.gather_for_metrics(value_loss).mean().item())
         
-        total_loss = policy_loss + 0.01 * value_loss
+        total_loss = policy_loss + self.value_loss_weight * value_loss
         return total_loss
-    
-    def _compute_value_loss(self, log_probs, target_ids):
-        loss = F.nll_loss(log_probs, target_ids)
-        return loss
     
     # Format into conversation
     def _make_critic_inputs(self, inputs):
@@ -273,6 +273,10 @@ class ActorCriticTrainer(GRPOEntropyTrainer):
     
     def _compute_advantages_from_critic(self, rewards, value_scalar):
         advantages = rewards - value_scalar.detach()
+
+        if self.normalize_advantages:
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
         return advantages
     
     def _log_stats(self, stats_dict, mode):

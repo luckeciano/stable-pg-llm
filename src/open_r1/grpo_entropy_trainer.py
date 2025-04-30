@@ -17,6 +17,7 @@ from transformers.integrations.deepspeed import deepspeed_init
 from transformers.trainer_pt_utils import find_batch_size
 from transformers.trainer_utils import EvalLoopOutput, has_length, denumpify_detensorize
 from transformers.utils import logging
+from transformers import LogitsProcessorList, LogitsProcessor
 from accelerate.utils import broadcast_object_list, gather, gather_object
 
 from trl.data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template
@@ -31,7 +32,21 @@ from open_r1.modifiable_grpo_trainer import ModifiableGRPOTrainer, RepeatRandomS
 
 logger = logging.get_logger(__name__)
 
+class MinProbabilityLogitsProcessor(LogitsProcessor):
+    def __init__(self, min_prob: float):
+        if not 0.0 < min_prob < 1.0:
+            raise ValueError("min_prob must be between 0 and 1.")
+        self.min_prob = min_prob
 
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        # Convert logits to probabilities
+        probs = torch.softmax(scores, dim=-1)
+        # Create a mask for tokens with probabilities below the threshold
+        mask = probs < self.min_prob
+        # Set logits of masked tokens to -inf
+        scores = scores.masked_fill(mask, float('-inf'))
+        return scores
+    
 class GRPOEntropyTrainer(ModifiableGRPOTrainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -39,6 +54,10 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
         self._metrics["num_completions_eval"] = []
         self._metrics["generated_tokens_train"] = []
         self._metrics["generated_tokens_eval"] = []
+        # self.logits_processor = LogitsProcessorList([MinProbabilityLogitsProcessor(0.01)])
+        self.entropy_alpha = kwargs['args'].entropy_alpha
+        self.smooth_logprobs = kwargs['args'].smooth_logprobs
+        self.softplus_alpha = kwargs['args'].softplus_alpha
 
     def _get_per_token_logps(self, model, input_ids, attention_mask, logits_to_keep, return_hidden_states=False):
         """Get per-token log probabilities and embeddings from the model.
@@ -156,8 +175,11 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         if return_outputs:
             raise ValueError("The GRPOTrainer does not support returning outputs")
-        # Compute the per-token log probabilities for the model
+        
+        # Log the metrics
+        mode = "eval" if self.control.should_evaluate else "train"
 
+        # Compute the per-token log probabilities for the model
         prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
         completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
         input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
@@ -166,9 +188,18 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
 
         per_token_logps = self._get_per_token_logps(model, input_ids, attention_mask, logits_to_keep)
 
+        if self.smooth_logprobs:
+            self._metrics[mode]["non_smoothed_logprobs/min"].append(self.accelerator.gather_for_metrics(per_token_logps.min()).mean().item())
+
+            # Smooth the logprobs
+            per_token_logps = self._smooth_logprobs(per_token_logps)
+
+            self._metrics[mode]["smoothed_logprobs/min"].append(self.accelerator.gather_for_metrics(per_token_logps.min()).mean().item())
+
+
         # Compute the KL divergence between the model and the reference model
         if self.beta != 0.0:
-            ref_per_token_logps = inputs["ref_per_token_logps"]
+            ref_per_token_logps = self._smooth_logprobs(inputs["ref_per_token_logps"]) if self.smooth_logprobs else inputs["ref_per_token_logps"]
             per_token_kl = (
                 torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
             )
@@ -177,7 +208,13 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
         advantages = inputs["advantages"]
         # When using num_iterations == 1, old_per_token_logps == per_token_logps, so we can skip it's computation (see
         # _generate_and_score_completions) and use per_token_logps.detach() instead.
-        old_per_token_logps = inputs["old_per_token_logps"] if self.num_iterations > 1 else per_token_logps.detach()
+        if self.num_iterations > 1 and self.smooth_logprobs:
+            old_per_token_logps = self._smooth_logprobs(inputs["old_per_token_logps"])
+        elif self.num_iterations > 1:
+            old_per_token_logps = inputs["old_per_token_logps"]
+        else:
+            old_per_token_logps = per_token_logps.detach()
+
         coef_1 = torch.exp(per_token_logps - old_per_token_logps)
         coef_2 = torch.clamp(coef_1, 1 - self.epsilon, 1 + self.epsilon)
         per_token_loss1 = coef_1 * advantages.unsqueeze(1)
@@ -186,19 +223,30 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
         if self.beta != 0.0:
             per_token_loss = per_token_loss + self.beta * per_token_kl
 
-        loss = self._compute_final_loss(per_token_loss, completion_mask)
+        if self.entropy_alpha != 0.0:
+            per_token_loss = per_token_loss + self.entropy_alpha * per_token_logps # This is the loss, so we add the per-token logps
 
-        # Log the metrics
-        mode = "eval" if self.control.should_evaluate else "train"
+        loss = self._compute_final_loss(per_token_loss, completion_mask)
 
         if self.beta != 0.0:
             mean_kl = ((per_token_kl * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
             self._metrics[mode]["kl"].append(self.accelerator.gather_for_metrics(mean_kl).mean().item())
 
+        if self.entropy_alpha != 0.0:
+            entropy_loss = ((self.entropy_alpha * per_token_logps * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).float()
+            self._accumulate_stats(
+                data=entropy_loss,
+                metric_name='entropy_loss',
+                mode=mode,
+            )
+
         is_clipped = (per_token_loss1 < per_token_loss2).float()
         clip_ratio = (is_clipped * completion_mask).sum() / completion_mask.sum()
         self._metrics[mode]["clip_ratio"].append(self.accelerator.gather_for_metrics(clip_ratio).mean().item())
         return loss
+    
+    def _smooth_logprobs(self, logprobs):
+        return torch.nn.functional.softplus(logprobs +  self.softplus_alpha) - self.softplus_alpha
     
     def _compute_prompt_ids_and_mask(self, inputs: dict[str, Union[torch.Tensor, Any]]) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -387,8 +435,24 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
         return advantages
     
     def _compute_final_loss(self, per_token_loss, completion_mask):
-        loss = (per_token_loss * completion_mask).sum() / completion_mask.sum()
-        return loss
+        z = completion_mask.sum(dim=1)
+        per_sentence_loss = per_token_loss * completion_mask
+        loss_1 = per_sentence_loss.sum(dim=1) / z
+        loss_avg_1 = loss_1.mean()
+
+        gather_loss_1 = self.accelerator.gather_for_metrics(loss_1)
+        mode = "eval" if self.control.should_evaluate else "train"
+
+        self._accumulate_stats(
+            data=gather_loss_1,
+            metric_name='policy_loss',
+            mode=mode,
+        )
+
+        # Old, buggy loss
+        loss_2 = (per_token_loss * completion_mask).sum() / completion_mask.sum()
+        return loss_avg_1
+
     
     def _log_stats(self, stats_dict, mode):
         rewards_per_func = stats_dict['rewards_per_func']
@@ -452,13 +516,61 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
 
         # save logprobs to wandb
         if old_per_token_logps is not None:
-            logprobs = self.accelerator.gather_for_metrics(old_per_token_logps.mean(1))
+            # Compute per-sequence mean log probs
+            mean_log_probs = (old_per_token_logps * completion_mask).sum(1) / completion_mask.sum(1)
+            gather_mean_log_probs = self.accelerator.gather(mean_log_probs)
+
+            # Compute per-token log probs, masked by completion_mask (variable length)
+            all_log_probs = old_per_token_logps.flatten()[completion_mask.flatten() == 1].float()
+
+            # Gather the number of valid tokens (lengths) from each process
+            local_length = torch.tensor([all_log_probs.shape[0]], device=all_log_probs.device)
+            gathered_lengths = self.accelerator.gather(local_length).flatten()  # Shape: [num_processes]
+
+            # Pad local all_log_probs to max length across processes
+            max_length = gathered_lengths.max().item()
+            padded_all_log_probs = torch.nn.functional.pad(
+                all_log_probs,
+                (0, max_length - all_log_probs.shape[0]),
+                value=0.0  # Pad with zeros (or NaN if you prefer)
+            )
+
+            # Gather padded tensors (same shape across processes)
+            gathered_padded_all_log_probs = self.accelerator.gather(padded_all_log_probs)
+
+            # Reshape (shape: [1, num_processes * max_length]) -> [num_processes, max_length]
+            gathered_padded_all_log_probs = gathered_padded_all_log_probs.reshape(-1, max_length)
+
+            # Compute mask tensors to remove padding
+            # Create a range for each position
+            positions = torch.arange(max_length, device=gathered_lengths.device).unsqueeze(0)  # shape [1, max_length]
+            # Compare to lengths
+            mask = positions < gathered_lengths.unsqueeze(1)  # shape [num_processes, max_length], bool
+
+            # Flatten mask and gathered_padded_all_log_probs
+            mask = mask.flatten()
+            gathered_padded_all_log_probs = gathered_padded_all_log_probs.flatten()
+
+            # Apply mask to gathered_padded_all_log_probs
+            gather_all_log_probs = gathered_padded_all_log_probs[mask]
+
+            # Accumulate stats
             self._accumulate_stats(
-                data=logprobs,
+                data=gather_mean_log_probs,
                 metric_name='mean_logprobs',
                 mode=mode,
-                stats={'mean': lambda x: x.mean().item()},
+                stats={
+                    'mean': lambda x: x.mean().item(),
+                    'var': lambda x: x.var().item()
+                },
             )
+
+            self._accumulate_stats(
+                data=gather_all_log_probs,
+                metric_name='all_logprobs',
+                mode=mode,
+            )
+
 
         prompts_to_log = gather_object(prompts_text)
         completions_to_log = gather_object(completions_text)
@@ -471,6 +583,7 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
             "completion": completions_to_log,
             "reward": rewards.tolist(),
             "correct": correct_responses.tolist(),
+            "advantages": advantages.tolist(),
         }
 
         # Add individual reward function values
@@ -508,7 +621,8 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
                 'min': lambda x: x.min().item(),
                 'p25': lambda x: x.quantile(0.25).item(),
                 'p75': lambda x: x.quantile(0.75).item(),
-                'median': lambda x: x.median().item()
+                'median': lambda x: x.median().item(),
+                'var': lambda x: x.var().item(),
             }
         
         # Save data in metrics dictionary, grouped by mode and groups
@@ -673,6 +787,8 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
 
             # Compute metrics using gathered rewards
             metrics['eval_accuracy_reward'] = gathered_accuracy_rewards.mean().item()
+            # if metrics['eval_accuracy_reward'] < 0.4:
+            #     raise ValueError("Accuracy reward is too low, aborting training")
 
         torch.cuda.empty_cache()
         return EvalLoopOutput(

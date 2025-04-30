@@ -51,6 +51,8 @@ from open_r1.grpo_entropy_trainer import GRPOEntropyTrainer
 from open_r1.dr_grpo_trainer import DrGRPOTrainer
 from open_r1.ac_trainer import ActorCriticTrainer
 from open_r1.ac_nobaseline import ActorCriticNoBaselineTrainer
+from open_r1.grpo_nobaseline_trainer import GRPONoBaselineTrainer
+
 
 logger = logging.getLogger(__name__)
 
@@ -261,7 +263,13 @@ def main(script_args, training_args, model_args):
     #############################
     # Initialize the GRPO trainer
     #############################
-    trainer_class = globals().get(script_args.trainer, GRPOEntropyTrainer)
+    if script_args.trainer is None:
+        trainer_class = GRPOEntropyTrainer
+    else:
+        trainer_class = globals().get(script_args.trainer)
+        if trainer_class is None:
+            raise ValueError(f"Trainer class '{script_args.trainer}' not found")
+        
     trainer = trainer_class(
         model=model_args.model_name_or_path,
         reward_funcs=reward_funcs,
