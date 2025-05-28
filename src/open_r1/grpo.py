@@ -188,6 +188,22 @@ def main(script_args, training_args, model_args):
     # Load the dataset
     dataset = load_dataset(script_args.dataset_name, name=script_args.dataset_config)
 
+    if script_args.dataset_name == "zwhe99/DeepMath-103K":
+        dataset = dataset.rename_column("final_answer", "solution")
+        # wrap solution in boxed
+        dataset = dataset.map(lambda x: {"solution": f"The solution is\\boxed{{{x['solution']}}}"})
+        dataset = dataset.rename_column("question", "problem")
+
+        # Split dataset into train/test with fixed sizes and random sampling
+        total_examples = len(dataset["train"])
+        test_size = 300
+        
+        # Shuffle once and split to avoid duplicate examples
+        shuffled_dataset = dataset["train"].shuffle(seed=42)
+        dataset["test"] = shuffled_dataset.select(range(test_size))
+        dataset["train"] = shuffled_dataset.select(range(test_size, total_examples))
+        training_args.eval_dataset_ratio = 1.0
+
     ################
     # Load tokenizer
     ################

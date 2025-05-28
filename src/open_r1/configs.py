@@ -60,7 +60,11 @@ class GRPOConfig(trl.GRPOConfig):
     value_type: str = field(default="digit", metadata={"help": "The type of value tokens to use. Possible values: digit, token."})
     value_inference_strategy: str = field(default="marginalization", metadata={"help": "The strategy to use for value inference. Possible values: marginalization, mode."})
     value_loss_weight: float = field(default=0.01, metadata={"help": "The weight of the value loss."})
+    value_loss: str = field(default="hard_label", metadata={"help": "The loss function to use for the value function. Possible values: hard_label, soft_label."})
     normalize_advantages: bool = field(default=False, metadata={"help": "Whether to normalize the advantages."})
+    advantage_target_std: float = field(default=1.0, metadata={"help": "The target std of the advantages."})
+    anneal_advantage_std: bool = field(default=False, metadata={"help": "Whether to anneal the advantage std."})
+    reward_intervals: list[tuple[float, float]] = field(default=None, metadata={"help": "The intervals for the rewards."})
 
     # Smooth GRPO
     smooth_logprobs: bool = field(default=False, metadata={"help": "Whether to smooth the logprobs."})
@@ -68,6 +72,7 @@ class GRPOConfig(trl.GRPOConfig):
 
     # MaxEnt RL
     entropy_alpha: float = field(default=0.0, metadata={"help": "The alpha for the entropy loss."})
+    entropy_estimator: str = field(default="logprobs", metadata={"help": "The estimator for the entropy loss. Possible values: logprobs, entropy."})
 
 
 

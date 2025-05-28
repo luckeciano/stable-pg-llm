@@ -17,6 +17,9 @@ class ActorCriticTrainer(GRPOEntropyTrainer):
         self.value_inference_strategy = kwargs['args'].value_inference_strategy
         self.value_loss_weight = kwargs['args'].value_loss_weight
         self.normalize_advantages = kwargs['args'].normalize_advantages
+        self.advantage_target_std = kwargs['args'].advantage_target_std
+        self.reward_intervals = kwargs['args'].reward_intervals
+        self.value_loss = kwargs['args'].value_loss
         
         if self.num_value_tokens % 2 == 0:
                 raise ValueError(f"num_value_tokens must be odd for digit value type.")
@@ -25,13 +28,16 @@ class ActorCriticTrainer(GRPOEntropyTrainer):
             if self.num_value_tokens >= 10 and self.num_value_tokens > 1:
                 raise ValueError(f"num_value_tokens must be less than 10 and greater than 1 for digit value type.")  
             self.target_tokens = [f"{i}" for i in range(1, self.num_value_tokens + 1)]
-            self.critic_prompt = f"Analyze the following problem carefully and provide a value function prediction between 1 and {self.num_value_tokens}. 1 is minimum value, {self.num_value_tokens} is maximum value. {self.num_value_tokens // 2} is the midpoint and means zero reward."
+            min_reward, max_reward, interval_size, possible_values = self._compute_reward_interval()
+            representation = "".join([f"Token {token} represents {value}\n" for token, value in zip(self.target_tokens, possible_values)])
+            self.critic_prompt = f"Analyze the following problem carefully and provide a value function prediction between 1 and {self.num_value_tokens}. Here is the value each token represents: {representation}."
         elif self.value_type == "token":
             self.target_tokens = [f"<VF_{i}>" for i in range(1, self.num_value_tokens + 1)]
             self.processing_class.add_tokens(self.target_tokens)
             # Resize token embeddings
             # self.model.resize_token_embeddings(len(self.processing_class))
-            self.critic_prompt = f"Analyze the following problem carefully and provide a value function prediction between <VF_1> and <VF_{self.num_value_tokens}>. <VF_1> is minimum value, <VF_{self.num_value_tokens}> is maximum value. <VF_{self.num_value_tokens // 2}> is the midpoint and means zero reward."
+            representation = "".join([f"Token {token} represents {value}\n" for token, value in zip(self.target_tokens, possible_values)])
+            self.critic_prompt = f"Analyze the following problem carefully and provide a value function prediction between <VF_1> and <VF_{self.num_value_tokens}>. Here is the value each token represents: {representation}."
         else:
             raise ValueError(f"Invalid value type: {self.value_type}")
         
@@ -76,9 +82,6 @@ class ActorCriticTrainer(GRPOEntropyTrainer):
 
         # Apply weights to each reward function's output and sum
         rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).sum(dim=1)
-
-        target_value = self._compute_target_value(rewards, self.reward_weights)
-
         advantages = self._compute_advantages_from_critic(rewards, values)
 
         table = self._log_stats(
@@ -106,7 +109,7 @@ class ActorCriticTrainer(GRPOEntropyTrainer):
             "ref_per_token_logps": ref_per_token_logps,
             "advantages": advantages,
             "values_log_probs": values_log_probs,
-            "target_value": target_value,
+            "rewards": rewards,
             "accuracy_reward": self.accelerator.gather(accuracy_reward),
         }
 
@@ -116,16 +119,37 @@ class ActorCriticTrainer(GRPOEntropyTrainer):
         return final_dict
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        mode = "eval" if self.control.should_evaluate else "train"
         policy_loss = super().compute_loss(model, inputs, return_outputs, num_items_in_batch)
+
+        # Compute the per-token log probabilities for the model
+        prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
+        completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
+        input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
+        logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
         
+        per_token_logps, entropy, _, _, _ = self._get_and_smooth_token_logps(self.model, input_ids, attention_mask, logits_to_keep, mode, return_entropy=self.entropy_estimator == "softmax")
+
+        rewards = inputs["rewards"]
+
+        if self.entropy_alpha > 0.0:
+            estimator = per_token_logps if self.entropy_estimator == "logprobs" else entropy
+            avg_entropy = (estimator * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)
+            rewards = rewards + self.entropy_alpha * avg_entropy
+
         values_log_probs = inputs["values_log_probs"]
-        target_value = inputs["target_value"]
 
         # Recompute value predictions with gradients enabled
-        value_loss = self._compute_value_loss(values_log_probs, target_value)
+        if self.value_loss == "hard_label":
+            target_value = self._compute_target_value(rewards)
+            value_loss = self._compute_value_loss(values_log_probs, target_value)
+        elif self.value_loss == "soft_label":
+            value_loss = self._compute_gaussian_soft_value_loss(values_log_probs, rewards)
+        else:
+            raise ValueError(f"Invalid value loss: {self.value_loss}")
 
         # Log the metrics
-        mode = "eval" if self.control.should_evaluate else "train"
         self._metrics[mode]["value_loss"].append(self.accelerator.gather_for_metrics(value_loss).mean().item())
         
         total_loss = policy_loss + self.value_loss_weight * value_loss
@@ -176,10 +200,7 @@ class ActorCriticTrainer(GRPOEntropyTrainer):
         return target_log_probs
     
     def _infer_values(self, log_probs, type="marginalization"):
-        min_reward, max_reward = self._compute_reward_interval(self.reward_weights)
-        # Split interval [min_reward, max_reward] into len(self.target_tokens) intervals
-        interval_size = (max_reward - min_reward) / (len(self.target_tokens) - 1)
-        possible_values = min_reward + torch.arange(len(self.target_tokens), device=log_probs.device) * interval_size
+        min_reward, max_reward, interval_size, possible_values = self._compute_reward_interval()
         
         mode_values = log_probs.argmax(dim=-1)
         pred_value_log_probs = torch.gather(log_probs, dim=1, index=mode_values.unsqueeze(-1)).squeeze(-1)
@@ -196,23 +217,15 @@ class ActorCriticTrainer(GRPOEntropyTrainer):
             raise ValueError(f"Invalid value inference strategy: {type}")
 
     
-    def _compute_target_value(self, rewards, reward_weights):
-        min_reward, max_reward = self._compute_reward_interval(reward_weights)
-        
-        # Split interval [min_reward, max_reward] into len(self.target_tokens) intervals
-        interval_size = (max_reward - min_reward) / (len(self.target_tokens) - 1)
-        target_values = torch.arange(min_reward, max_reward, interval_size, device=rewards.device)
-
+    def _compute_target_value(self, rewards):
+        min_reward, max_reward, interval_size, possible_values = self._compute_reward_interval()
         # Assign rewards to the closest target value
-        target_value = torch.argmin(torch.abs(rewards.unsqueeze(-1) - target_values), dim=-1)
+        target_value = torch.argmin(torch.abs(rewards.unsqueeze(-1) - possible_values), dim=-1)
 
         return target_value
     
-    def _compute_value_scalar(self, value, reward_weights):
-        min_reward, max_reward = self._compute_reward_interval(reward_weights)
-
-        # Split interval (min_reward, max_reward) into len(self.target_tokens) intervals
-        interval_size = (max_reward - min_reward) / (len(self.target_tokens) - 1)
+    def _compute_value_scalar(self, value):
+        min_reward, max_reward, interval_size, possible_values = self._compute_reward_interval()
 
         # Convert value to scalar
         return min_reward + value * interval_size
@@ -232,28 +245,27 @@ class ActorCriticTrainer(GRPOEntropyTrainer):
         loss = -torch.sum(true_dist * log_probs, dim=1).mean()
         return loss
     
-    #TODO
-    def _compute_gaussian_soft_value_loss(self, log_probs, target_ids, smoothing=0.1):
+    def _compute_gaussian_soft_value_loss(self, log_probs, target_scalars):
         """
         log_probs: [batch_size, num_classes] - log-probabilities (log_softmax applied)
-        target_ids: [batch_size] - ground truth class indices
+        target_scalars: [batch_size] - ground truth scalar values
         sigma: standard deviation for Gaussian smoothing
         """
         batch_size, num_classes = log_probs.shape
         device = log_probs.device
-
-        # Create class index vector: [0, 1, ..., num_classes-1]
-        class_range = torch.arange(num_classes, device=device).float()  # [num_classes]
+        min_reward, max_reward, bin_width, target_values = self._compute_reward_interval()
 
         # Expand to shape [batch_size, num_classes] to match targets
-        class_range = class_range.unsqueeze(0).expand(batch_size, -1)  # [B, C]
+        target_values = target_values.unsqueeze(0).expand(batch_size, -1)  # [B, C]
 
         # Expand target ids to match shape
-        target_ids = target_ids.unsqueeze(1).float()  # [B, 1]
+        target_scalars = target_scalars.unsqueeze(1).float()  # [B, 1]
 
         # Compute squared distance from the target class
-        squared_dist = (class_range - target_ids) ** 2  # [B, C]
+        squared_dist = (target_values - target_scalars) ** 2  # [B, C]
 
+        
+        sigma = 0.33 * bin_width
         # Compute unnormalized Gaussian
         unnormalized = torch.exp(-squared_dist / (2 * sigma ** 2))  # [B, C]
 
@@ -265,17 +277,31 @@ class ActorCriticTrainer(GRPOEntropyTrainer):
 
         return loss
 
-    def _compute_reward_interval(self, reward_weights):
-        # We assume each reward function is bounded between -1 and 1
-        min_reward = -1.0 * reward_weights.sum()
-        max_reward = 1.0 * reward_weights.sum()
-        return min_reward, max_reward
+    def _compute_reward_interval(self):
+        # We assume each reward function is bounded
+        min_reward = 0.0
+        max_reward = 0.0
+        for interval, weight in zip(self.reward_intervals, self.reward_weights):
+            min_reward += interval[0] * weight
+            max_reward += interval[1] * weight
+        
+        # if self.entropy_alpha > 0.0:
+        #     # min reward does not change as log1 = 0
+        #     max_reward += 1.0 # this limits the expressivity of the value function, but in practice it is fine
+
+        interval_size = (max_reward - min_reward) / (len(self.target_tokens) - 1)
+        possible_values = min_reward + torch.arange(len(self.target_tokens), device=self.accelerator.device) * interval_size
+
+        return min_reward, max_reward, interval_size, possible_values
     
     def _compute_advantages_from_critic(self, rewards, value_scalar):
         advantages = rewards - value_scalar.detach()
 
         if self.normalize_advantages:
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+            gathered_advantages = self.accelerator.gather(advantages)
+            advantages = (advantages - gathered_advantages.mean()) / (gathered_advantages.std() + 1e-8)
+
+        advantages = advantages * self.advantage_target_std
 
         return advantages
     

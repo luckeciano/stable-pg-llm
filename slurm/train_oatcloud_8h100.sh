@@ -1,10 +1,11 @@
 #!/bin/bash
 #SBATCH --cpus-per-task=96
-#SBATCH --gres=gpu:a100:4
+#SBATCH --gres=gpu:h100:8
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --exclusive
 #SBATCH --job-name="r1-token-entropy"
+#SBATCH --partition=h100
 #SBATCH --output=/users/lucelo/logs/slurm-%j.out
 #SBATCH --error=/users/lucelo/logs/slurm-%j.err
 

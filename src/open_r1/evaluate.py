@@ -16,6 +16,8 @@
 
 import random
 
+from open_r1.utils.custom_metrics import make_metrics_at_k
+
 from lighteval.metrics.dynamic_metrics import (
     ExprExtractionConfig,
     IndicesExtractionConfig,
@@ -49,6 +51,11 @@ C) {C}
 D) {D}
 """.strip()
 
+k_values = [1, 4, 8, 16, 32, 64, 96, 128]
+# k_values = [1]
+
+print(f"k_values: {k_values}")
+
 latex_gold_metric = multilingual_extractive_match_metric(
     language=Language.ENGLISH,
     fallback_mode="first_match",
@@ -57,6 +64,7 @@ latex_gold_metric = multilingual_extractive_match_metric(
     # Match boxed first before trying other regexes
     pred_extraction_target=(ExprExtractionConfig(), LatexExtractionConfig(boxed_match_priority=0)),
     aggregation_function=max,
+    timeout_seconds=1
 )
 
 expr_gold_metric = multilingual_extractive_match_metric(
@@ -67,6 +75,7 @@ expr_gold_metric = multilingual_extractive_match_metric(
     # Match boxed first before trying other regexes
     pred_extraction_target=(ExprExtractionConfig(), LatexExtractionConfig(boxed_match_priority=0)),
     aggregation_function=max,
+    timeout_seconds=1
 )
 
 gpqa_metric = multilingual_extractive_match_metric(
@@ -74,8 +83,27 @@ gpqa_metric = multilingual_extractive_match_metric(
     gold_extraction_target=[IndicesExtractionConfig(prefix_for_extraction="NativeLetters")],
     pred_extraction_target=[IndicesExtractionConfig(prefix_for_extraction="NativeLetters")],
     precision=5,
+    timeout_seconds=1
 )
 
+minerva_metric = multilingual_extractive_match_metric(
+    language=Language.ENGLISH,
+    fallback_mode="first_match",
+    precision=5,
+    gold_extraction_target=(LatexExtractionConfig(), ExprExtractionConfig()),
+    # Match boxed first before trying other regexes
+    pred_extraction_target=(ExprExtractionConfig(), LatexExtractionConfig(boxed_match_priority=0)),
+    aggregation_function=max,
+    timeout_seconds=1
+)
+
+olympiadbench_metric = multilingual_extractive_match_metric(
+    language=Language.ENGLISH,
+    precision=5,
+    gold_extraction_target=(LatexExtractionConfig(), ExprExtractionConfig()),
+    pred_extraction_target=(ExprExtractionConfig(), LatexExtractionConfig(boxed_match_priority=0)),
+    timeout_seconds=1
+)
 
 def math_prompt_fn(line, task_name: str = None):
     return Doc(
@@ -110,6 +138,37 @@ def gpqa_prompt_fn(line, task_name: str = None):
         instruction=query,
     )
 
+def minervamath_prompt_fn(line, task_name: str = None):
+    return Doc(
+        task_name=task_name,
+        query=MATH_QUERY_TEMPLATE.format(Question=line["question"]),
+        choices=[f"The solution is \\boxed{{{line['answer']}}}"],
+        gold_index=0,
+    )
+
+def gsm8k_prompt_fn(line, task_name: str = None):
+    return Doc(
+        task_name=task_name,
+        query=MATH_QUERY_TEMPLATE.format(Question=line["problem"]),
+        choices=[line["expected_answer"]],
+        gold_index=0,
+    )
+
+def amc23_prompt_fn(line, task_name: str = None):
+    return Doc(
+        task_name=task_name,
+        query=MATH_QUERY_TEMPLATE.format(Question=line["question"]),
+        choices=[str(line["answer"])],
+        gold_index=0,
+    )
+
+def olympiadbench_prompt_fn(line, task_name: str = None):
+    return Doc(
+        task_name=task_name,
+        query=MATH_QUERY_TEMPLATE.format(Question=line["question"]),
+        choices=[f"The solution is \\boxed{{{line['final_answer']}}}"],
+        gold_index=0,
+    )
 
 # Define tasks
 aime24 = LightevalTaskConfig(
@@ -119,12 +178,13 @@ aime24 = LightevalTaskConfig(
     hf_repo="HuggingFaceH4/aime_2024",
     hf_subset="default",
     hf_avail_splits=["train"],
-    evaluation_splits=["train"],
+    evaluation_splits=["train"],    
     few_shots_split=None,
     few_shots_select=None,
     generation_size=32768,
-    metric=[expr_gold_metric],
+    metric=[expr_gold_metric] + make_metrics_at_k(k_values, expr_gold_metric),
     version=1,
+    num_samples=max(k_values)
 )
 aime25 = LightevalTaskConfig(
     name="aime25",
@@ -137,8 +197,9 @@ aime25 = LightevalTaskConfig(
     few_shots_split=None,
     few_shots_select=None,
     generation_size=32768,
-    metric=[expr_gold_metric],
+    metric=[expr_gold_metric] + make_metrics_at_k(k_values, expr_gold_metric),
     version=1,
+    num_samples=max(k_values)
 )
 math_500 = LightevalTaskConfig(
     name="math_500",
@@ -151,8 +212,9 @@ math_500 = LightevalTaskConfig(
     few_shots_split=None,
     few_shots_select=None,
     generation_size=32768,
-    metric=[latex_gold_metric],
+    metric=[latex_gold_metric] + make_metrics_at_k(k_values, latex_gold_metric),
     version=1,
+    num_samples=max(k_values)
 )
 gpqa_diamond = LightevalTaskConfig(
     name="gpqa:diamond",
@@ -165,12 +227,76 @@ gpqa_diamond = LightevalTaskConfig(
     few_shots_split=None,
     few_shots_select=None,
     generation_size=32768,  # needed for reasoning models like R1
-    metric=[gpqa_metric],
+    metric=[gpqa_metric] + make_metrics_at_k(k_values, gpqa_metric),
     stop_sequence=[],  # no stop sequence, will use eos token
     trust_dataset=True,
     version=1,
+    num_samples=max(k_values)
 )
 
+minervamath = LightevalTaskConfig( 
+    name="minervamath",
+    suite=["custom"],
+    prompt_function=minervamath_prompt_fn,
+    hf_repo="math-ai/minervamath",
+    hf_subset="default",
+    hf_avail_splits=["test"],
+    evaluation_splits=["test"],
+    few_shots_split=None,
+    few_shots_select=None,
+    generation_size=32768,
+    metric=[minerva_metric] + make_metrics_at_k(k_values, minerva_metric),
+    version=1, 
+    num_samples=max(k_values)
+)
+
+gsm8k = LightevalTaskConfig( 
+    name="gsm8k",
+    suite=["custom"],
+    prompt_function=gsm8k_prompt_fn,
+    hf_repo="zwhe99/gsm8k",
+    hf_subset="default",
+    hf_avail_splits=["test"],
+    evaluation_splits=["test"],
+    few_shots_split=None,
+    few_shots_select=None,
+    generation_size=32768,
+    metric=[expr_gold_metric] + make_metrics_at_k(k_values, expr_gold_metric),
+    version=1, 
+    num_samples=max(k_values)
+)
+
+amc23 = LightevalTaskConfig( 
+    name="amc23",
+    suite=["custom"],
+    prompt_function=amc23_prompt_fn,
+    hf_repo="zwhe99/amc23",
+    hf_subset="default",
+    hf_avail_splits=["test"],
+    evaluation_splits=["test"],
+    few_shots_split=None,
+    few_shots_select=None,
+    generation_size=32768,
+    metric=[expr_gold_metric] + make_metrics_at_k(k_values, expr_gold_metric),
+    version=1, 
+    num_samples=max(k_values)
+)
+
+olympiadbench = LightevalTaskConfig(
+    name="olympiadbench",
+    suite=["custom"],
+    prompt_function=olympiadbench_prompt_fn,
+    hf_repo="zwhe99/simplerl-OlympiadBench",
+    hf_subset="default",
+    hf_avail_splits=["test"],
+    evaluation_splits=["test"],
+    few_shots_split=None,
+    few_shots_select=None,
+    generation_size=32768,
+    metric=[olympiadbench_metric] + make_metrics_at_k(k_values, olympiadbench_metric),
+    version=1, 
+    num_samples=max(k_values)
+)
 
 # Add tasks to the table
 TASKS_TABLE = []
@@ -178,6 +304,10 @@ TASKS_TABLE.append(aime24)
 TASKS_TABLE.append(aime25)
 TASKS_TABLE.append(math_500)
 TASKS_TABLE.append(gpqa_diamond)
+TASKS_TABLE.append(minervamath)
+TASKS_TABLE.append(gsm8k)
+TASKS_TABLE.append(amc23)
+TASKS_TABLE.append(olympiadbench)
 
 # MODULE LOGIC
 if __name__ == "__main__":

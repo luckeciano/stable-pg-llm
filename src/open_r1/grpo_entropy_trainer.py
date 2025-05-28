@@ -12,6 +12,7 @@ from torch.utils.data import DataLoader, Sampler
 
 
 import transformers
+import torch.nn.functional as F
 from transformers import Trainer
 from transformers.integrations.deepspeed import deepspeed_init
 from transformers.trainer_pt_utils import find_batch_size
@@ -47,6 +48,16 @@ class MinProbabilityLogitsProcessor(LogitsProcessor):
         scores = scores.masked_fill(mask, float('-inf'))
         return scores
     
+DEFAULT_STATS = {
+    'mean': lambda x: x.mean().item(),
+    'max': lambda x: x.max().item(),
+    'min': lambda x: x.min().item(),
+    'p25': lambda x: x.quantile(0.25).item(),
+    'p75': lambda x: x.quantile(0.75).item(),
+    'median': lambda x: x.median().item(),
+    'var': lambda x: x.var().item(),
+}
+    
 class GRPOEntropyTrainer(ModifiableGRPOTrainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -58,8 +69,22 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
         self.entropy_alpha = kwargs['args'].entropy_alpha
         self.smooth_logprobs = kwargs['args'].smooth_logprobs
         self.softplus_alpha = kwargs['args'].softplus_alpha
+        self.entropy_estimator = kwargs['args'].entropy_estimator
 
-    def _get_per_token_logps(self, model, input_ids, attention_mask, logits_to_keep, return_hidden_states=False):
+    def _get_and_smooth_token_logps(self, model, input_ids, attention_mask, logits_to_keep, mode, return_hidden_states=False, return_entropy=False):
+        per_token_logps, entropy, embeddings, probs, action_one_hot = self._get_per_token_logps(model, input_ids, attention_mask, logits_to_keep, return_hidden_states=return_hidden_states, return_entropy=return_entropy)
+
+        if self.smooth_logprobs:
+            self._metrics[mode]["non_smoothed_logprobs/min"].append(self.accelerator.gather_for_metrics(per_token_logps.min()).mean().item())
+
+            # Smooth the logprobs
+            per_token_logps = self._smooth_logprobs(per_token_logps)
+
+            self._metrics[mode]["smoothed_logprobs/min"].append(self.accelerator.gather_for_metrics(per_token_logps.min()).mean().item())
+        
+        return per_token_logps, entropy, embeddings, probs, action_one_hot
+
+    def _get_per_token_logps(self, model, input_ids, attention_mask, logits_to_keep, return_hidden_states=False, return_entropy=False):
         """Get per-token log probabilities and embeddings from the model.
         
         Args:
@@ -81,14 +106,28 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
         input_ids = input_ids[:, -logits_to_keep:]
         # For transformers<=4.48, logits_to_keep argument isn't supported, so here we drop logits ourselves.
         # See https://github.com/huggingface/trl/issues/2770
+        # compute logprobs
         logits = logits[:, -logits_to_keep:]
         log_probs = selective_log_softmax(logits, input_ids)  # compute logprobs for the input tokens
+
+        # compute softmax entropy
+        entropy, probs, action_one_hot = None, None, None
+        if return_entropy:
+            entropy, probs, top_k_indices = self._compute_entropy(logits, k = self.generation_config.top_k)
+
+            # Expand input_ids to match the shape of top_k_indices
+            input_ids_expanded = input_ids.unsqueeze(-1)  # (batch_size, seq_len, 1)
+            
+            # Compare input_ids with top_k_indices
+            action_one_hot = (input_ids_expanded == top_k_indices).float()  # (batch_size, seq_len, num_tokens)
+
+
+        embeddings = None
         if return_hidden_states:
             # hidden states are (num_layers, batch, sequence, hidden)
             embeddings = torch.stack([x for x in outputs.hidden_states])  # (num_layers, B, L, H)
-            return log_probs, embeddings
-        else:
-            return log_probs
+        
+        return log_probs, entropy, embeddings, probs, action_one_hot
 
     # override the _generate_and_score_completions method to pass logprobs to the entropy reward function
     def _generate_and_score_completions(
@@ -186,17 +225,22 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
 
-        per_token_logps = self._get_per_token_logps(model, input_ids, attention_mask, logits_to_keep)
+        per_token_logps, entropy, hidden_states, probs, action_one_hot = self._get_and_smooth_token_logps(self.model, input_ids, attention_mask, logits_to_keep, mode, \
+                                                                       return_entropy=True, return_hidden_states=True)
+        
+        self._compute_and_log_gradient_norm(hidden_states, per_token_logps, probs, inputs["advantages"], completion_mask, mode)
+        self._compute_and_log_gradient_direction(hidden_states, action_one_hot, probs, inputs["advantages"], completion_mask, mode)
+        self._compute_and_log_softmax_probs_stats(probs, completion_mask, mode)
 
-        if self.smooth_logprobs:
-            self._metrics[mode]["non_smoothed_logprobs/min"].append(self.accelerator.gather_for_metrics(per_token_logps.min()).mean().item())
+        gathered_entropy = self._gather_masked_tensor_across_processes(entropy, completion_mask)
+        self._accumulate_stats(
+            data=gathered_entropy,
+            metric_name='policy_entropy',
+            mode=mode,
+            stats=DEFAULT_STATS,
+        )
 
-            # Smooth the logprobs
-            per_token_logps = self._smooth_logprobs(per_token_logps)
-
-            self._metrics[mode]["smoothed_logprobs/min"].append(self.accelerator.gather_for_metrics(per_token_logps.min()).mean().item())
-
-
+        
         # Compute the KL divergence between the model and the reference model
         if self.beta != 0.0:
             ref_per_token_logps = self._smooth_logprobs(inputs["ref_per_token_logps"]) if self.smooth_logprobs else inputs["ref_per_token_logps"]
@@ -224,7 +268,12 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
             per_token_loss = per_token_loss + self.beta * per_token_kl
 
         if self.entropy_alpha != 0.0:
-            per_token_loss = per_token_loss + self.entropy_alpha * per_token_logps # This is the loss, so we add the per-token logps
+            if self.entropy_estimator == "logprobs":
+                per_token_loss = per_token_loss + self.entropy_alpha * per_token_logps # H = E[-log(p)], so we sum the logprobs in the loss
+            elif self.entropy_estimator == "softmax":
+                per_token_loss = per_token_loss - self.entropy_alpha * entropy # Here is the entropy directly, so we subtract it from the loss
+            else:
+                raise ValueError(f"Invalid entropy estimator: {self.entropy_estimator}")
 
         loss = self._compute_final_loss(per_token_loss, completion_mask)
 
@@ -233,7 +282,11 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
             self._metrics[mode]["kl"].append(self.accelerator.gather_for_metrics(mean_kl).mean().item())
 
         if self.entropy_alpha != 0.0:
-            entropy_loss = ((self.entropy_alpha * per_token_logps * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).float()
+            if self.entropy_estimator == "logprobs":
+                entropy_loss = ((self.entropy_alpha * per_token_logps * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).float()
+            elif self.entropy_estimator == "softmax":
+                entropy_loss = -((self.entropy_alpha * entropy * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).float()
+
             self._accumulate_stats(
                 data=entropy_loss,
                 metric_name='entropy_loss',
@@ -244,6 +297,252 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
         clip_ratio = (is_clipped * completion_mask).sum() / completion_mask.sum()
         self._metrics[mode]["clip_ratio"].append(self.accelerator.gather_for_metrics(clip_ratio).mean().item())
         return loss
+    
+
+    def _compute_and_log_softmax_probs_stats(self, softmax_probs, completion_mask, mode):
+        # Compute sharpness
+        with torch.inference_mode():
+            sharpness = self.estimate_sharpness_from_probs(softmax_probs)
+            gathered_sharpness = self._gather_masked_tensor_across_processes(sharpness, completion_mask)
+            self._accumulate_stats(
+                data=gathered_sharpness,
+                metric_name='policy_sharpness',
+                mode=mode,
+            )
+
+            # Compute average softmax probability
+            gathered_softmax_probs = self._gather_masked_tensor3d_across_processes(softmax_probs, completion_mask)
+            mean_softmax_probs = torch.mean(gathered_softmax_probs, dim=0)
+            if self.accelerator.is_main_process:
+                    # sample 10000 random actions following the distribution of the mean softmax probabilities
+                    random_actions = torch.multinomial(mean_softmax_probs, 10000, replacement=True)
+                    # Convert to numpy and compute histogram with fixed bins from 0 to 49
+                    actions_np = random_actions.detach().cpu().numpy()
+                    hist_values, hist_bins = np.histogram(actions_np, bins=50, range=(0,50), density=True)
+                    wandb.log({
+                        "actions/density": wandb.Histogram(np_histogram=(hist_values, hist_bins))
+                    })
+
+    def estimate_sharpness_from_probs(self, probs: torch.Tensor, threshold: float = 1e-4, default_sharpness: float = 10.0) -> torch.Tensor:
+        """
+        Estimate sharpness (1/tau) using log-linear regression on log(pi) vs. index,
+        ignoring actions where pi < threshold. If support < 2, return default sharpness.
+
+        Args:
+            probs (torch.Tensor): Softmax probabilities, shape (batch, seq_len, num_actions).
+            threshold (float): Probability cutoff for including an action in the fit.
+            default_sharpness (float): Fallback value when support is too small.
+
+        Returns:
+            torch.Tensor: Estimated sharpness (1/tau), shape (batch, seq_len)
+        """
+        B, T, K = probs.shape
+        device = probs.device
+        dtype = probs.dtype
+
+        indices = torch.arange(K, device=device, dtype=dtype).view(1, 1, -1)  # (1, 1, K)
+        log_probs = torch.log(probs + 1e-12)  # (B, T, K)
+
+        mask = (probs > threshold).float()  # (B, T, K)
+        support = mask.sum(dim=-1)  # (B, T)
+        valid = support >= 2  # (B, T)
+
+        mask_sum = support.clamp(min=1.0).unsqueeze(-1)  # (B, T, 1)
+        x_mean = (indices * mask).sum(dim=-1, keepdim=True) / mask_sum
+        y_mean = (log_probs * mask).sum(dim=-1, keepdim=True) / mask_sum
+
+        x_centered = indices - x_mean
+        y_centered = log_probs - y_mean
+
+        cov_xy = (mask * x_centered * y_centered).sum(dim=-1) / mask_sum.squeeze(-1)
+        var_x = (mask * x_centered**2).sum(dim=-1) / mask_sum.squeeze(-1)
+
+        sharpness = -cov_xy / (var_x + 1e-12)  # Avoid divide-by-zero
+
+        # Where not valid (support < 2), assign default sharpness
+        sharpness = torch.where(valid, sharpness, torch.full_like(sharpness, default_sharpness))
+        return sharpness
+
+    def _compute_and_log_gradient_direction(self, hidden_states, one_hot_actions, softmax_probs, advantages, completion_mask, mode):
+        """
+        Returns:
+            grad_directions: Tensor of shape (B, T, D) - normalized gradient direction vectors
+        """
+
+        with torch.inference_mode():
+            T = completion_mask.shape[1]
+
+            # Compute (e_a - pi): shape (B, T, K)
+            delta = one_hot_actions - softmax_probs  # (B, T, K)
+
+            # Multiply by advantages: shape (B, T, K)
+            weighted_delta = advantages.unsqueeze(-1).unsqueeze(-1) * delta  # (B, T, K)
+
+            # Features
+            features = hidden_states[-1, :, -T:, :]
+
+            # Compute gradient: weighted sum of features per token
+            # (B, T, K) @ (B, T, D) → (B, T, D)
+            gradients = torch.einsum('btk,btd->btd', weighted_delta, features)
+
+            # ---- 1. Full variance of gradients across samples (per token) ----
+            gathered_gradients = self._gather_masked_tensor3d_across_processes(gradients, completion_mask)
+            grad_mean = gathered_gradients.mean(dim=0)
+            grad_var = torch.norm(gathered_gradients - grad_mean, dim=-1) ** 2  # (B, T)
+            self._accumulate_stats(
+                data=grad_var,
+                metric_name='per_token_full_gradient_variance',
+                mode=mode,
+                stats={ 'variance': lambda x: x.mean().item(),
+                    'max_squared_error': lambda x: x.max().item() },
+            )
+            
+            # ---- 2. Variance of policy error term delta = (e - pi) across samples ----
+            gathered_delta = self._gather_masked_tensor3d_across_processes(delta, completion_mask)
+            delta_mean = gathered_delta.mean(dim=0)
+            delta_var = torch.norm(gathered_delta - delta_mean, dim=-1) ** 2  # (B, T)
+            self._accumulate_stats(
+                data=delta_var,
+                metric_name='policy_error_vector_variance',
+                mode=mode,
+                stats={ 'metric': lambda x: x.mean().item(),
+                    'max_squared_error': lambda x: x.max().item() },
+            )
+
+            # ---- 3. Variance of hidden states across samples ----
+            gathered_features = self._gather_masked_tensor3d_across_processes(features, completion_mask)
+            h_mean = gathered_features.mean(dim=0)
+            h_var = torch.norm(gathered_features - h_mean, dim=-1) ** 2  # (B, T)
+            self._accumulate_stats(
+                data=h_var,
+                metric_name='feature_vector_variance',
+                mode=mode,
+                stats={ 'metric': lambda x: x.mean().item(),
+                    'max_squared_error': lambda x: x.max().item() },
+            )
+
+            # ---- 4. Sentence-level gradient variance across samples ----
+            grad_mean_per_sentence = gradients.mean(dim=1)  # (B, D)
+            gathered_sentence_gradients = self.accelerator.gather(grad_mean_per_sentence)
+            global_mean = gathered_sentence_gradients.mean(dim=0)  # (1, D)
+            grad_var_per_sentence = torch.norm(gathered_sentence_gradients - global_mean, dim=-1) ** 2  # (B,)
+            self._accumulate_stats(
+                data=grad_var_per_sentence,
+                metric_name='sentence_full_gradient_variance',
+                mode=mode,
+                stats={ 'metric': lambda x: x.mean().item(),
+                    'max_squared_error': lambda x: x.max().item(),
+                    'p75': lambda x: x.quantile(0.75).item(),
+                    'p90': lambda x: x.quantile(0.9).item(),
+                    'p95': lambda x: x.quantile(0.95).item(),
+                    'p99': lambda x: x.quantile(0.99).item(), },
+            )
+
+            # Compute per sentence average gradient norm
+            # Compute averages over groups of N elements
+            N = self.num_generations
+            num_groups = len(gathered_sentence_gradients) // N
+            grad_norm_per_state = gathered_sentence_gradients.reshape(num_groups, N, -1) # (B, N, D)
+            mu_s = grad_norm_per_state.mean(dim=1) # (B, D)
+            
+            # Action level variance
+            sq_sigma_s = (torch.norm(grad_norm_per_state - mu_s.unsqueeze(1), dim=-1) ** 2).mean(dim=1) # (B,)
+
+            # State level variance
+            avg_mu_s = mu_s.mean(dim=0) # (D,)
+            sq_mu_error = torch.norm(mu_s - avg_mu_s, dim=-1) ** 2
+
+            self._accumulate_stats(
+                data=sq_sigma_s,
+                metric_name='action_level_variance_full_gradient',
+                mode=mode,
+                stats={ 'metric': lambda x: x.mean().item() } # action level variance is the mean of the variance
+            )
+
+            self._accumulate_stats(
+                data=sq_mu_error,
+                metric_name='state_level_variance_full_gradient',
+                mode=mode,
+                stats={'metric': lambda x: x.mean().item() }
+            )
+
+    def _compute_and_log_gradient_norm(self, hidden_states, logprobs, softmax_probs, advantages, completion_mask, mode):
+        # Compute feature norm
+        with torch.inference_mode():
+            seq_len = logprobs.shape[1]
+            feature_norm = torch.norm(hidden_states[-1, :, -seq_len:, :], dim=-1)
+            gathered_feature_norm = self._gather_masked_tensor_across_processes(feature_norm, completion_mask)
+            self._accumulate_stats(
+                data=gathered_feature_norm,
+                metric_name='per_token_feature_norm',
+                mode=mode,
+                stats=DEFAULT_STATS,
+            )
+
+            policy_norm_sq = (softmax_probs**2).sum(dim=-1)
+            probs = torch.exp(logprobs)
+            policy_error_norm = torch.abs(1 - 2 * probs + policy_norm_sq)
+
+            gathered_policy_error_norm = self._gather_masked_tensor_across_processes(policy_error_norm, completion_mask)
+            self._accumulate_stats(
+                data=gathered_policy_error_norm,
+                metric_name='per_token_policy_error_norm',
+                mode=mode
+            )
+
+            grad_norm = torch.abs(advantages.unsqueeze(1)) * torch.sqrt(policy_error_norm) * feature_norm
+
+
+            mean_grad_norm = (grad_norm * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)
+            gathered_mean_grad_norm = self.accelerator.gather(mean_grad_norm)
+            self._accumulate_stats(
+                data=gathered_mean_grad_norm,
+                metric_name='per_sentence_gradient_norm',
+                mode=mode,
+                stats={
+                    **DEFAULT_STATS,
+                    'p85': lambda x: x.quantile(0.85).item(),
+                    'p90': lambda x: x.quantile(0.9).item(),
+                    'p95': lambda x: x.quantile(0.95).item(),
+                    'p99': lambda x: x.quantile(0.99).item(),
+                },
+            )
+
+            # Compute per sentence average gradient norm
+            # Compute averages over groups of N elements
+            N = self.num_generations
+            num_groups = len(gathered_mean_grad_norm) // N
+            grad_norm_per_state = gathered_mean_grad_norm.reshape(num_groups, N)
+            mu_s = grad_norm_per_state.mean(dim=1)
+            sq_sigma_s = grad_norm_per_state.var(dim=1)
+
+            self._accumulate_stats(
+                data=sq_sigma_s,
+                metric_name='action_level_variance',
+                mode=mode,
+                stats={ 'metric': lambda x: x.mean().item() } # action level variance is the mean of the variance
+            )
+
+            self._accumulate_stats(
+                data=mu_s,
+                metric_name='state_level_variance',
+                mode=mode,
+                stats={'metric': lambda x: x.var().item() } # state level variance is the variance of the mean
+            )
+
+
+            gathered_all_grad_norm = self._gather_masked_tensor_across_processes(grad_norm, completion_mask)
+            self._accumulate_stats(
+                data=gathered_all_grad_norm,
+                metric_name='per_token_gradient_norm',
+                mode=mode,
+                stats={
+                    **DEFAULT_STATS,
+                    'p1': lambda x: x.quantile(0.01).item(),
+                    'p5': lambda x: x.quantile(0.05).item(),
+                    'p10': lambda x: x.quantile(0.1).item(),
+                }
+            )
     
     def _smooth_logprobs(self, logprobs):
         return torch.nn.functional.softplus(logprobs +  self.softplus_alpha) - self.softplus_alpha
@@ -340,7 +639,7 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
             # When using num_iterations == 1, old_per_token_logps == per_token_logps, so we can skip it's
             # computation here, and use per_token_logps.detach() instead.
             # if self.num_iterations > 1:
-            old_per_token_logps, old_last_token_embeddings = self._get_per_token_logps(
+            old_per_token_logps, _, old_last_token_embeddings, _, _ = self._get_per_token_logps(
                 self.model, prompt_completion_ids, attention_mask, logits_to_keep, return_hidden_states=True
             )
             # else:
@@ -349,12 +648,12 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
             if self.beta == 0.0:
                 ref_per_token_logps = None
             elif self.ref_model is not None:
-                ref_per_token_logps = self._get_per_token_logps(
+                ref_per_token_logps, _, _, _, _ = self._get_per_token_logps(
                     self.ref_model, prompt_completion_ids, attention_mask, logits_to_keep
                 )
             else:
                 with self.accelerator.unwrap_model(self.model).disable_adapter():
-                    ref_per_token_logps = self._get_per_token_logps(
+                    ref_per_token_logps, _, _, _, _ = self._get_per_token_logps(
                         self.model, prompt_completion_ids, attention_mask, logits_to_keep
                     )
 
@@ -521,38 +820,7 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
             gather_mean_log_probs = self.accelerator.gather(mean_log_probs)
 
             # Compute per-token log probs, masked by completion_mask (variable length)
-            all_log_probs = old_per_token_logps.flatten()[completion_mask.flatten() == 1].float()
-
-            # Gather the number of valid tokens (lengths) from each process
-            local_length = torch.tensor([all_log_probs.shape[0]], device=all_log_probs.device)
-            gathered_lengths = self.accelerator.gather(local_length).flatten()  # Shape: [num_processes]
-
-            # Pad local all_log_probs to max length across processes
-            max_length = gathered_lengths.max().item()
-            padded_all_log_probs = torch.nn.functional.pad(
-                all_log_probs,
-                (0, max_length - all_log_probs.shape[0]),
-                value=0.0  # Pad with zeros (or NaN if you prefer)
-            )
-
-            # Gather padded tensors (same shape across processes)
-            gathered_padded_all_log_probs = self.accelerator.gather(padded_all_log_probs)
-
-            # Reshape (shape: [1, num_processes * max_length]) -> [num_processes, max_length]
-            gathered_padded_all_log_probs = gathered_padded_all_log_probs.reshape(-1, max_length)
-
-            # Compute mask tensors to remove padding
-            # Create a range for each position
-            positions = torch.arange(max_length, device=gathered_lengths.device).unsqueeze(0)  # shape [1, max_length]
-            # Compare to lengths
-            mask = positions < gathered_lengths.unsqueeze(1)  # shape [num_processes, max_length], bool
-
-            # Flatten mask and gathered_padded_all_log_probs
-            mask = mask.flatten()
-            gathered_padded_all_log_probs = gathered_padded_all_log_probs.flatten()
-
-            # Apply mask to gathered_padded_all_log_probs
-            gather_all_log_probs = gathered_padded_all_log_probs[mask]
+            gather_all_log_probs = self._gather_masked_tensor_across_processes(old_per_token_logps, completion_mask)
 
             # Accumulate stats
             self._accumulate_stats(
@@ -569,8 +837,21 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
                 data=gather_all_log_probs,
                 metric_name='all_logprobs',
                 mode=mode,
+                stats={
+                    **DEFAULT_STATS,
+                    'p1': lambda x: x.quantile(0.01).item(),
+                    'p5': lambda x: x.quantile(0.05).item(),
+                    'p10': lambda x: x.quantile(0.1).item(),
+                }
             )
 
+            # Plot histogram of logprobs in wandb
+            if self.accelerator.is_main_process:
+                wandb.log({
+                    "logprobs/histogram": wandb.Histogram(
+                        gather_all_log_probs.cpu().numpy()
+                    )
+                })
 
         prompts_to_log = gather_object(prompts_text)
         completions_to_log = gather_object(completions_text)
@@ -604,7 +885,7 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
 
         return table
         
-    def _accumulate_stats(self, data, metric_name, mode, groups=None, stats=None):
+    def _accumulate_stats(self, data, metric_name, mode, groups=None, stats=DEFAULT_STATS):
         """Accumulate statistics for the given data.
         
         Args:
@@ -613,18 +894,6 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
             mode (str): Either "train" or "eval"
             groups (dict, optional): Dictionary mapping group names to boolean masks for data grouping
         """
-        # Default statistics if none provided
-        if stats is None:
-            stats = {
-                'mean': lambda x: x.mean().item(),
-                'max': lambda x: x.max().item(),
-                'min': lambda x: x.min().item(),
-                'p25': lambda x: x.quantile(0.25).item(),
-                'p75': lambda x: x.quantile(0.75).item(),
-                'median': lambda x: x.median().item(),
-                'var': lambda x: x.var().item(),
-            }
-        
         # Save data in metrics dictionary, grouped by mode and groups
         # If metric_name is not in metrics, create it
         if metric_name not in self._metrics[mode]:
@@ -833,3 +1102,107 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
             mini_repeat_count=1, # No repeats for evaluation
             seed=self.args.seed,
         )
+    
+    def _compute_entropy(self, logits, chunk_size=128, k=200):
+        # Compute the entropy of the top k logits
+        top_k_logits, top_k_indices = torch.topk(logits, k=k, dim=-1)
+        log_probs = F.log_softmax(top_k_logits, dim=-1)
+        probs = torch.exp(log_probs)
+        entropy = -(probs * log_probs).sum(dim=-1)
+        return entropy, probs, top_k_indices
+
+    def _gather_masked_tensor_across_processes(self, tensor: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """
+        Gather a tensor across all processes, masking by a boolean/int mask (same shape as tensor),
+        and return a 1D tensor of all valid (masked) values across all processes.
+
+        Args:
+            tensor (torch.Tensor): The tensor to gather and mask (e.g., per-token logprobs).
+            mask (torch.Tensor): The mask tensor (same shape as tensor), 1 for valid, 0 for invalid.
+
+        Returns:
+            torch.Tensor: 1D tensor of all valid values across all processes.
+        """
+        # Flatten and mask locally
+        flat_tensor = tensor.flatten()[mask.flatten() == 1].float()
+
+        # Gather the number of valid tokens from each process
+        local_length = torch.tensor([flat_tensor.shape[0]], device=flat_tensor.device)
+        gathered_lengths = self.accelerator.gather(local_length).flatten()  # Shape: [num_processes]
+
+        # Pad local tensor to max length across processes
+        max_length = gathered_lengths.max().item()
+        padded_flat_tensor = torch.nn.functional.pad(
+            flat_tensor,
+            (0, max_length - flat_tensor.shape[0]),
+            value=0.0  # Pad with zeros (or NaN if you prefer)
+        )
+
+        # Gather padded tensors (same shape across processes)
+        gathered_padded_flat_tensor = self.accelerator.gather(padded_flat_tensor)
+
+        # Reshape to [num_processes, max_length]
+        gathered_padded_flat_tensor = gathered_padded_flat_tensor.reshape(-1, max_length)
+
+        # Create mask to remove padding
+        positions = torch.arange(max_length, device=gathered_lengths.device).unsqueeze(0)  # [1, max_length]
+        mask = positions < gathered_lengths.unsqueeze(1)  # [num_processes, max_length], bool
+
+        # Flatten mask and gathered tensor
+        mask = mask.flatten()
+        gathered_padded_flat_tensor = gathered_padded_flat_tensor.flatten()
+
+        # Apply mask to get all valid values
+        gathered_valid_values = gathered_padded_flat_tensor[mask]
+        return gathered_valid_values
+
+
+    def _gather_masked_tensor3d_across_processes(self, tensor: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """
+        Gather a 3D tensor across all processes, masking by a boolean/int mask (same shape as tensor without K),
+        and return a 2D tensor of all valid (masked) values across all processes.
+
+        Args:
+            tensor (torch.Tensor): The tensor to gather and mask, shape (B, T, K).
+            mask (torch.Tensor): The mask tensor, shape (B, T), 1 for valid, 0 for invalid.
+
+        Returns:
+            torch.Tensor: 2D tensor of all valid values across all processes, shape (num_valid_tokens, K)
+        """
+        B, T, K = tensor.shape
+        tensor_2d = tensor.reshape(-1, K)  # (B*T, K)
+        mask_1d = mask.reshape(-1)         # (B*T,)
+        flat_tensor = tensor_2d[mask_1d == 1].float()  # (num_valid, K)
+
+        # Gather the number of valid tokens from each process
+        local_length = torch.tensor([flat_tensor.shape[0]], device=flat_tensor.device)
+        gathered_lengths = self.accelerator.gather(local_length).flatten()  # Shape: [num_processes]
+
+        # Pad local tensor to max length across processes
+        max_length = gathered_lengths.max().item()
+        pad_rows = max_length - flat_tensor.shape[0]
+        if pad_rows > 0:
+            padded_flat_tensor = torch.cat(
+                [flat_tensor, torch.zeros((pad_rows, K), dtype=flat_tensor.dtype, device=flat_tensor.device)],
+                dim=0
+            )
+        else:
+            padded_flat_tensor = flat_tensor
+
+        # Gather padded tensors (same shape across processes)
+        gathered_padded_flat_tensor = self.accelerator.gather(padded_flat_tensor)
+
+        # Reshape to [num_processes, max_length, K]
+        gathered_padded_flat_tensor = gathered_padded_flat_tensor.reshape(-1, max_length, K)
+
+        # Create mask to remove padding
+        positions = torch.arange(max_length, device=gathered_lengths.device).unsqueeze(0)  # [1, max_length]
+        mask_valid = positions < gathered_lengths.unsqueeze(1)  # [num_processes, max_length], bool
+
+        # Flatten mask and gathered tensor
+        mask_valid = mask_valid.flatten()
+        gathered_padded_flat_tensor = gathered_padded_flat_tensor.reshape(-1, K)
+
+        # Apply mask to get all valid values
+        gathered_valid_values = gathered_padded_flat_tensor[mask_valid]
+        return gathered_valid_values
