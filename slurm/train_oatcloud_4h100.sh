@@ -1,9 +1,7 @@
 #!/bin/bash
-#SBATCH --cpus-per-task=96
-#SBATCH --gres=gpu:h100:8
+#SBATCH --cpus-per-task=48
+#SBATCH --gres=gpu:h100:4
 #SBATCH --nodes=1
-#SBATCH --ntasks-per-node=1
-#SBATCH --exclusive
 #SBATCH --job-name="r1-token-entropy"
 #SBATCH --partition=h100
 #SBATCH --output=/users/lucelo/logs/slurm-%j.out
@@ -23,6 +21,9 @@ rm -rf ~/.cache/pip
 export PIP_NO_CACHE_DIR=1
 export PIP_DEFAULT_TIMEOUT=100
 export PYTHONWARNINGS="ignore::DeprecationWarning"
+
+# Check number of GPUs
+echo "Number of GPUs: $(SLURM_JOB_GPUS)"
 
 /scratch-ssd/oatml/run_locked.sh /scratch-ssd/oatml/miniconda3/bin/conda-env update -f ~/maxent-rl-r1/environment.yml
 source /scratch-ssd/oatml/miniconda3/bin/activate maxent-r1-lucelo
@@ -52,7 +53,7 @@ OPTIONAL_ARGS=""
 
 # Training setup
 NUM_NODES=$SLURM_NNODES
-GPUS_PER_NODE=8
+GPUS_PER_NODE=4
 WORLD_SIZE=$(($NUM_NODES*$GPUS_PER_NODE))
 # Due to conflicts between Accelerate's DeepSpeed configs and Transformers' TrainingArguments, we need to parse the gradient accumulation steps from the config file to ensure they match
 CONFIG_FILE=recipes/$MODEL/$TASK/config_$CONFIG_SUFFIX.yaml
