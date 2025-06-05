@@ -52,6 +52,7 @@ from open_r1.dr_grpo_trainer import DrGRPOTrainer
 from open_r1.ac_trainer import ActorCriticTrainer
 from open_r1.ac_nobaseline import ActorCriticNoBaselineTrainer
 from open_r1.grpo_nobaseline_trainer import GRPONoBaselineTrainer
+from open_r1.grpo_mini_batch_trainer import GRPOMiniBatchTrainer
 
 
 logger = logging.getLogger(__name__)
@@ -150,6 +151,8 @@ class GRPOScriptArguments(ScriptArguments):
 def main(script_args, training_args, model_args):
     # Set seed for reproducibility
     set_seed(training_args.seed)
+
+    training_args.hub_model_id = f"{training_args.hub_model_id}_{training_args.seed}"
 
     ###############
     # Setup logging

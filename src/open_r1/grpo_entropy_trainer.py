@@ -70,6 +70,9 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
         self.smooth_logprobs = kwargs['args'].smooth_logprobs
         self.softplus_alpha = kwargs['args'].softplus_alpha
         self.entropy_estimator = kwargs['args'].entropy_estimator
+        self.rayleigh_lambda = kwargs['args'].rayleigh_lambda
+        self.rayleigh_mask_tau = kwargs['args'].rayleigh_mask_tau
+        self.advantage_target_std = kwargs['args'].advantage_target_std
 
     def _get_and_smooth_token_logps(self, model, input_ids, attention_mask, logits_to_keep, mode, return_hidden_states=False, return_entropy=False):
         per_token_logps, entropy, embeddings, probs, action_one_hot = self._get_per_token_logps(model, input_ids, attention_mask, logits_to_keep, return_hidden_states=return_hidden_states, return_entropy=return_entropy)
@@ -230,6 +233,7 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
         
         self._compute_and_log_gradient_norm(hidden_states, per_token_logps, probs, inputs["advantages"], completion_mask, mode)
         self._compute_and_log_gradient_direction(hidden_states, action_one_hot, probs, inputs["advantages"], completion_mask, mode)
+        rayleigh_coeff = self._compute_and_log_rayleigh_coefficient(hidden_states, action_one_hot, probs, inputs["advantages"], completion_mask, mode)
         self._compute_and_log_softmax_probs_stats(probs, completion_mask, mode)
 
         gathered_entropy = self._gather_masked_tensor_across_processes(entropy, completion_mask)
@@ -274,6 +278,15 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
                 per_token_loss = per_token_loss - self.entropy_alpha * entropy # Here is the entropy directly, so we subtract it from the loss
             else:
                 raise ValueError(f"Invalid entropy estimator: {self.entropy_estimator}")
+            
+        if self.rayleigh_lambda != 0.0:
+            per_token_loss = per_token_loss + self.rayleigh_lambda * rayleigh_coeff
+
+        if self.rayleigh_mask_tau != 0.0:
+            rayleigh_mask = rayleigh_coeff < self.rayleigh_mask_tau
+            per_token_loss = per_token_loss * rayleigh_mask
+            rayleigh_clip_ratio = (~rayleigh_mask * completion_mask).sum() / completion_mask.sum()
+            self._metrics[mode]["rayleigh_clip_ratio"].append(self.accelerator.gather_for_metrics(rayleigh_clip_ratio).mean().item())
 
         loss = self._compute_final_loss(per_token_loss, completion_mask)
 
@@ -543,6 +556,147 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
                     'p10': lambda x: x.quantile(0.1).item(),
                 }
             )
+
+    def _compute_and_log_rayleigh_coefficient(self, hidden_states, one_hot_actions, softmax_probs, advantages, completion_mask, mode):
+        """
+        Compute the Rayleigh coefficient for each token in the sequence.
+        """
+        # Helper function to encapsulate the calculations and logging
+        def _compute_rayleigh_coefficient():
+            # Original content of the calculations and logging
+            seq_len = softmax_probs.shape[1]
+            features = hidden_states[-1, :, -seq_len:, :]  # [batch, seq, hidden_dim]
+            feature_norm_sq = torch.norm(features, dim=-1) ** 2  # [batch, seq]
+
+            pi = softmax_probs  # [batch, seq, vocab]
+            e_a = one_hot_actions  # [batch, seq, vocab]
+            v = e_a - pi  # [batch, seq, vocab]
+
+            # Fisher Information Matrix projection: v^T F v
+            # Construct (e_i - pi): shape [batch, seq, vocab, vocab]
+            identity = torch.eye(pi.shape[-1], device=pi.device).unsqueeze(0).unsqueeze(0)  # [1, 1, vocab, vocab]
+            e_i_minus_pi = identity - pi.unsqueeze(-2)  # [batch, seq, vocab, vocab]
+
+            # Compute inner products v^T (e_i - pi) for all i
+            v_unsq = v.unsqueeze(-2)  # [batch, seq, 1, vocab]
+            inner_products = torch.matmul(v_unsq, e_i_minus_pi.transpose(-1, -2)).squeeze(-2)  # [batch, seq, vocab]
+
+            fisher_proj = (pi * inner_products ** 2).sum(dim=-1)  # [batch, seq]
+
+            # Compute ||v||^2
+            policy_error_norm_sq = (v ** 2).sum(dim=-1)  # [batch, seq]
+
+            # Compute final Rayleigh coefficient
+            # This is the value that will be returned and potentially used in the loss
+            calculated_rayleigh_coeff = advantages.unsqueeze(1) * (policy_error_norm_sq - fisher_proj) * feature_norm_sq  # [batch, seq]
+            abs_rayleigh_coeff = torch.abs(calculated_rayleigh_coeff)
+
+            grad_norm_sq = (advantages.unsqueeze(1)**2) * policy_error_norm_sq * feature_norm_sq
+            gathered_grad_norm_sq = self._gather_masked_tensor_across_processes(grad_norm_sq, completion_mask)
+
+            gathered_rayleigh_coeff = self._gather_masked_tensor_across_processes(calculated_rayleigh_coeff, completion_mask)
+
+            # ------------------------------- Per token metrics -------------------------------
+            self._accumulate_stats(
+                data=gathered_rayleigh_coeff,
+                metric_name='per_token_rayleigh_coeff',
+                mode=mode
+            )
+
+            self._accumulate_stats(
+                data=torch.abs(gathered_rayleigh_coeff),
+                metric_name='per_token_rayleigh_coeff_abs',
+                mode=mode
+            )
+
+            # log quadractic coefficient
+            lr = self.lr_scheduler.get_last_lr()[0]
+            quadratic_coeff = 0.5 * gathered_rayleigh_coeff * lr**2
+            self._accumulate_stats(
+                data=quadratic_coeff,
+                metric_name='per_token_rayleigh_coeff_quadratic',
+                mode=mode
+            )
+
+            # log quadratic term
+            quadratic_term = gathered_grad_norm_sq * quadratic_coeff
+            self._accumulate_stats(
+                data=quadratic_term,
+                metric_name='per_token_quadratic_term',
+                mode=mode
+            )
+
+            # log full update term
+            full_update_term = - lr * gathered_grad_norm_sq + quadratic_term
+            self._accumulate_stats(
+                data=full_update_term,
+                metric_name='per_token_full_update_term',
+                mode=mode
+            )
+
+            # ------------------------------- Per sentence metrics -------------------------------
+            mean_rayleigh = (calculated_rayleigh_coeff * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)
+            mean_grad_norm_sq = (grad_norm_sq * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)
+
+            gathered_mean_rayleigh = self.accelerator.gather(mean_rayleigh)
+            gathered_mean_grad_norm_sq = self.accelerator.gather(mean_grad_norm_sq)
+            self._accumulate_stats(
+                data=gathered_mean_rayleigh,
+                metric_name='per_sentence_rayleigh_coeff',
+                mode=mode,
+                stats={
+                    **DEFAULT_STATS,
+                    'p85': lambda x: x.quantile(0.85).item(),
+                    'p90': lambda x: x.quantile(0.9).item(),
+                    'p95': lambda x: x.quantile(0.95).item(),
+                    'p99': lambda x: x.quantile(0.99).item(),
+                    'p1': lambda x: x.quantile(0.01).item(),
+                    'p5': lambda x: x.quantile(0.05).item(),
+                },
+            )
+
+            self._accumulate_stats(
+                data=torch.abs(gathered_mean_rayleigh),
+                metric_name='per_sentence_rayleigh_coeff_abs',
+                mode=mode
+            )
+
+            # log quadratic coefficient
+            quadratic_coeff = 0.5 * gathered_mean_rayleigh * lr**2
+            self._accumulate_stats(
+                data=quadratic_coeff,
+                metric_name='per_sentence_rayleigh_coeff_quadratic',
+                mode=mode
+            )
+
+            # log quadratic term
+            quadratic_term = gathered_mean_grad_norm_sq * quadratic_coeff
+            self._accumulate_stats(
+                data=quadratic_term,
+                metric_name='per_sentence_quadratic_term',
+                mode=mode
+            )
+
+            # log full update term
+            full_update_term = - lr * gathered_mean_grad_norm_sq + quadratic_term
+            self._accumulate_stats(
+                data=full_update_term,
+                metric_name='per_sentence_full_update_term',
+                mode=mode
+            )
+
+            return abs_rayleigh_coeff
+
+        if self.rayleigh_lambda == 0.0:
+            # If lambda is 0, compute in inference mode to save resources
+            with torch.inference_mode():
+                rayleigh_coeff = _compute_rayleigh_coefficient()
+        else:
+            # If lambda is non-zero, compute normally to allow for gradients
+            rayleigh_coeff = _compute_rayleigh_coefficient()
+            
+        return rayleigh_coeff
+
     
     def _smooth_logprobs(self, logprobs):
         return torch.nn.functional.softplus(logprobs +  self.softplus_alpha) - self.softplus_alpha
@@ -704,6 +858,7 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
                 # Repeat all input columns (but "prompt" and "completion") to match the number of generations
                 keys = [key for key in inputs[0] if key not in ["prompt", "completion"]]
                 reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
+                reward_kwargs['dataset'] = self.train_dataset if self.control.should_evaluate else self.eval_dataset
                 output_reward_func = reward_func(prompts=prompts, completions=completions, **reward_kwargs)
                 rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
                 # Check which responses are correct based on accuracy reward
@@ -730,7 +885,13 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
         # Normalize the rewards to compute the advantages
         mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
         std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
-        advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)    
+
+        if self.advantage_target_std is None or self.advantage_target_std == 0.0:
+            advantages = rewards - mean_grouped_rewards
+        else:
+            std_grouped_rewards = std_grouped_rewards * self.advantage_target_std
+            advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)
+
         return advantages
     
     def _compute_final_loss(self, per_token_loss, completion_mask):

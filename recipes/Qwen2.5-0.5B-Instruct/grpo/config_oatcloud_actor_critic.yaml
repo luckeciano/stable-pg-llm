@@ -22,7 +22,7 @@ save_steps: 1
 eval_dataset_ratio: 0.005
 load_best_model_at_end: true
 metric_for_best_model: accuracy_reward
-gradient_accumulation_steps: 1
+gradient_accumulation_steps: 2
 gradient_checkpointing: true
 gradient_checkpointing_kwargs:
   use_reentrant: false
@@ -41,6 +41,7 @@ max_steps: -1
 smooth_logprobs: true
 softplus_alpha: 10.0
 entropy_alpha: 0.1
+entropy_estimator: softmax
 num_generations: 2
 num_train_epochs: 1
 output_dir: data/Qwen-2.5-0.5B-Instruct-AC-RL
@@ -63,16 +64,27 @@ embedding_entropy_token: last # last, mean, concat
 # embedding_entropy_hidden_state_reduction: (-1, 100) # concat layer idxs in this range # TODO could mean pool too
 reward_weights:
 - 1.0
-- 1.0
+- 0.0
 - 0.0
 - 0.0
 # - 0.0
+reward_intervals:
+- [0.0, 1.0]
+- [0.0, 1.0]
+- [-1.0, 1.0] # TODO: Check if this is correct
+- [-1.0, 0.0]
+# - [-1.0, 1.0]
 seed: 42
 warmup_ratio: 0.1
 beta: 0.0
-trainer: ActorCriticNoBaselineTrainer
+trainer: GRPOEntropyTrainer
 num_value_tokens: 5
 value_type: digit
 value_inference_strategy: marginalization
-value_loss_weight: 0.0
+value_loss: soft_label
+value_loss_weight: 0.01
 normalize_advantages: true
+anneal_advantage_std: true
+advantage_target_std: 0.75
+rayleigh_lambda: 0.1
+rayleigh_mask_tau: 0.1

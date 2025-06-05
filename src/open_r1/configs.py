@@ -74,6 +74,10 @@ class GRPOConfig(trl.GRPOConfig):
     entropy_alpha: float = field(default=0.0, metadata={"help": "The alpha for the entropy loss."})
     entropy_estimator: str = field(default="logprobs", metadata={"help": "The estimator for the entropy loss. Possible values: logprobs, entropy."})
 
+    # Rayleigh
+    rayleigh_lambda: float = field(default=0.0, metadata={"help": "The lambda for the rayleigh loss."})
+    rayleigh_mask_tau: float = field(default=0.0, metadata={"help": "The tau for the rayleigh mask."})
+
 
 
 @dataclass
