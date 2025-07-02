@@ -51,8 +51,8 @@ C) {C}
 D) {D}
 """.strip()
 
-k_values = [1, 4, 8, 16, 32, 64, 96, 128]
-# k_values = [1]
+# k_values = [1, 4, 8, 16, 32, 64, 96, 128]
+k_values = [1]
 
 print(f"k_values: {k_values}")
 

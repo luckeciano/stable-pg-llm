@@ -46,8 +46,8 @@ SYSTEM_PROMPT=$8
 
 NUM_GPUS=$(nvidia-smi -L | wc -l)
 # TASKS="custom|aime24|0|0,custom|math_500|0|0,custom|gpqa:diamond|0|0"
-TASKS="custom|aime25|0|0"
-# TASKS="custom|aime25|0|0,custom|aime24|0|0,custom|math_500|0|0,custom|gpqa:diamond|0|0,custom|minervamath|0|0,custom|gsm8k|0|0,custom|amc23|0|0"
+# TASKS="custom|aime25|0|0"
+TASKS="custom|aime25|0|0,custom|aime24|0|0,custom|math_500|0|0,custom|gpqa:diamond|0|0,custom|minervamath|0|0,custom|gsm8k|0|0,custom|amc23|0|0"
 MODEL_NAME=$(echo $MODEL_ID | sed 's/\//_/g')
 ACCELERATE_USE_DEEPSPEED=false
 HF_HUB_ENABLE_HF_TRANSFER=1

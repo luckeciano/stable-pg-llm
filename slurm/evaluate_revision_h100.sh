@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH --cpus-per-task=12
-#SBATCH --gres=gpu:a100:1
+#SBATCH --gres=gpu:h100:1
 #SBATCH --nodes=1
 #SBATCH --job-name="eval-revision"
-#SBATCH --partition=normal
+#SBATCH --partition=h100
 #SBATCH --output=/users/lucelo/logs/slurm-%j.out
 #SBATCH --error=/users/lucelo/logs/slurm-%j.err
 #SBATCH --requeue

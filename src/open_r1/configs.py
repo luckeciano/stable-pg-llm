@@ -75,8 +75,11 @@ class GRPOConfig(trl.GRPOConfig):
     entropy_estimator: str = field(default="logprobs", metadata={"help": "The estimator for the entropy loss. Possible values: logprobs, entropy."})
 
     # Rayleigh
-    rayleigh_lambda: float = field(default=0.0, metadata={"help": "The lambda for the rayleigh loss."})
-    rayleigh_mask_tau: float = field(default=0.0, metadata={"help": "The tau for the rayleigh mask."})
+    curvature_lambda: float = field(default=0.0, metadata={"help": "The lambda for the rayleigh loss."})
+    curvature_mask_tau: float = field(default=0.0, metadata={"help": "The tau for the rayleigh mask."})
+    curvature_reg_fn: str = field(default=None, metadata={"help": "The function to use for the rayleigh regularization. Possible values: global, token, sentence."})
+    curvature_mask_fn: str = field(default=None, metadata={"help": "The function to use for the rayleigh mask. Possible values: global, token, sentence."})
+    curvature_estimator: str = field(default="hessian", metadata={"help": "The estimator for the rayleigh loss. Possible values: hessian, fisher."})
 
 
 

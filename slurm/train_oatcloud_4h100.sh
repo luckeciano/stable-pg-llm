@@ -85,7 +85,8 @@ done
 echo "Gradient accumulation steps: $GRAD_ACC_STEPS"
 # so processes know who to talk to
 MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)
-MASTER_PORT=29500
+# Generate a random port between 29500 and 29750
+MASTER_PORT=$(shuf -i 29500-29750 -n 1)
 
 echo "MASTER_ADDR: $MASTER_ADDR"
 echo "MASTER_PORT: $MASTER_PORT"

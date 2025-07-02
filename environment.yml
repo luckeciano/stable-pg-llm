@@ -13,10 +13,11 @@ dependencies:
   - cuda-toolkit=12.4
   - pip:
       - uv
-      - vllm==0.8.5.post1
+      - vllm==0.7.2
       - setuptools==75.8.0
       - bitsandbytes==0.45.3
       - datasets==3.4.1
       - fastapi==0.115.11
       - huggingface-hub==0.30.0
       - wandb==0.19.8
+      - ../reasoning-gym

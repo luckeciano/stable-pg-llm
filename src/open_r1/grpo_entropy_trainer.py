@@ -70,8 +70,11 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
         self.smooth_logprobs = kwargs['args'].smooth_logprobs
         self.softplus_alpha = kwargs['args'].softplus_alpha
         self.entropy_estimator = kwargs['args'].entropy_estimator
-        self.rayleigh_lambda = kwargs['args'].rayleigh_lambda
-        self.rayleigh_mask_tau = kwargs['args'].rayleigh_mask_tau
+        self.curvature_lambda = kwargs['args'].curvature_lambda
+        self.curvature_mask_tau = kwargs['args'].curvature_mask_tau
+        self.curvature_reg_fn = kwargs['args'].curvature_reg_fn
+        self.curvature_mask_fn = kwargs['args'].curvature_mask_fn
+        self.curvature_estimator = kwargs['args'].curvature_estimator
         self.advantage_target_std = kwargs['args'].advantage_target_std
 
     def _get_and_smooth_token_logps(self, model, input_ids, attention_mask, logits_to_keep, mode, return_hidden_states=False, return_entropy=False):
@@ -233,8 +236,20 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
         
         self._compute_and_log_gradient_norm(hidden_states, per_token_logps, probs, inputs["advantages"], completion_mask, mode)
         self._compute_and_log_gradient_direction(hidden_states, action_one_hot, probs, inputs["advantages"], completion_mask, mode)
-        rayleigh_coeff = self._compute_and_log_rayleigh_coefficient(hidden_states, action_one_hot, probs, inputs["advantages"], completion_mask, mode)
+        hessian_coeff, full_update_term = self._compute_and_log_hessian_coefficient(hidden_states, action_one_hot, probs, inputs["advantages"], completion_mask, mode)
+        fisher_curvature, approx_kl = self._compute_and_log_fisher_curvature(hidden_states, action_one_hot, probs, inputs["advantages"], completion_mask, mode)
         self._compute_and_log_softmax_probs_stats(probs, completion_mask, mode)
+
+        if self.curvature_estimator == "hessian" and self.curvature_mask_tau != 0.0:
+            curvature_mask = (full_update_term[self.curvature_mask_fn] < self.curvature_mask_tau)
+            curvature_mask = curvature_mask if curvature_mask.shape == completion_mask.shape else curvature_mask.unsqueeze(-1).expand_as(completion_mask)
+            updated_mask = completion_mask * curvature_mask
+            self._compute_and_log_hessian_coefficient(hidden_states, action_one_hot, probs, inputs["advantages"], updated_mask, mode, prefix="masked")
+        elif self.curvature_estimator == "fisher" and self.curvature_mask_tau != 0.0:
+            curvature_mask = (approx_kl[self.curvature_mask_fn] < self.curvature_mask_tau)
+            curvature_mask = curvature_mask if curvature_mask.shape == completion_mask.shape else curvature_mask.unsqueeze(-1).expand_as(completion_mask)
+            updated_mask = completion_mask * curvature_mask
+            self._compute_and_log_fisher_curvature(hidden_states, action_one_hot, probs, inputs["advantages"], updated_mask, mode, prefix="masked")
 
         gathered_entropy = self._gather_masked_tensor_across_processes(entropy, completion_mask)
         self._accumulate_stats(
@@ -278,17 +293,14 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
                 per_token_loss = per_token_loss - self.entropy_alpha * entropy # Here is the entropy directly, so we subtract it from the loss
             else:
                 raise ValueError(f"Invalid entropy estimator: {self.entropy_estimator}")
-            
-        if self.rayleigh_lambda != 0.0:
-            per_token_loss = per_token_loss + self.rayleigh_lambda * rayleigh_coeff
 
-        if self.rayleigh_mask_tau != 0.0:
-            rayleigh_mask = rayleigh_coeff < self.rayleigh_mask_tau
-            per_token_loss = per_token_loss * rayleigh_mask
-            rayleigh_clip_ratio = (~rayleigh_mask * completion_mask).sum() / completion_mask.sum()
-            self._metrics[mode]["rayleigh_clip_ratio"].append(self.accelerator.gather_for_metrics(rayleigh_clip_ratio).mean().item())
-
-        loss = self._compute_final_loss(per_token_loss, completion_mask)
+        curvature_estimator = None
+        if self.curvature_estimator == "hessian":
+            curvature_estimator = full_update_term
+        elif self.curvature_estimator == "fisher":
+            curvature_estimator = approx_kl
+        
+        loss = self._compute_final_loss(per_token_loss, completion_mask, curvature_estimator)
 
         if self.beta != 0.0:
             mean_kl = ((per_token_kl * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
@@ -557,92 +569,172 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
                 }
             )
 
-    def _compute_and_log_rayleigh_coefficient(self, hidden_states, one_hot_actions, softmax_probs, advantages, completion_mask, mode):
+    def _compute_and_log_hessian_coefficient(self, hidden_states, one_hot_actions, softmax_probs, advantages, completion_mask, mode, prefix=""):
         """
-        Compute the Rayleigh coefficient for each token in the sequence.
+        Compute the hessian coefficient for each token in the sequence.
         """
+        def compute_hessian_token_level(A, v, h, pi, g_flat, mask):
+            # Computes: ρ = A (‖v‖² - vᵀ F v / ‖v‖²) ‖h‖²
+            v_norm_sq = (v ** 2).sum(-1)                      # [B, T]
+            h_norm_sq = (h ** 2).sum(-1)                      # [B, T]
+            fisher_proj = (pi * (v ** 2)).sum(-1)             # [B, T]
+            norm_fisher = fisher_proj / (v_norm_sq + 1e-8)     # [B, T]
+            hessian_token = A * (v_norm_sq - norm_fisher) * h_norm_sq
+            return hessian_token
+        
+        def compute_per_sample_hessian_contributions(u, A, v, pi):
+            # Step 2: First term: (vᵗ u)^2
+            dot = (v * u).sum(dim=-1)  # (B, T)
+            first_term = dot ** 2      # (B, T)
+
+            # Step 3: Compute Fisher matrix F = diag(pi) - pi @ piᵗ
+            F_diag = torch.diag_embed(pi)                          # (B, T, V, V)
+            pi_outer = pi.unsqueeze(-1) @ pi.unsqueeze(-2)         # (B, T, V, V)
+            F = F_diag - pi_outer                                  # (B, T, V, V)
+
+            # Step 4: Compute uᵗ F u = Tr(F u uᵗ)
+            u_unsq = u.unsqueeze(-1)                               # (B, T, V, 1)
+            F_u = torch.matmul(F, u_unsq).squeeze(-1)              # (B, T, V)
+            second_term = (F_u * u).sum(dim=-1)                    # (B, T)
+
+            # Step 5: Final term: A * (first - second)
+            delta = first_term - second_term                       # (B, T)
+            contrib = A * delta                        # (B, T)
+            return contrib
+        
+        def compute_hessian_sentence_level(g_sent, A, v, h, pi, mask, gather_fn):
+            # Step 1: Reshape g_sent to (B, V, H)
+            B, T, V = v.shape
+            H = h.shape[-1]
+            G = g_sent.view(B, V, H)  # (B, V, H)
+
+            # Step 2: Compute u = G @ h
+            # G: (B, V, H), h: (B, T, H) => u: (B, T, V)
+            u = torch.einsum('bvh,bth->btv', G, h)  # u = G h
+
+            # Step 3: Compute per-sample contributions
+            contrib = compute_per_sample_hessian_contributions(u, A, v, pi)
+
+            # Step 4: Masked sentence-level average
+            contrib = contrib * mask         # (B, T)
+            sentence_sum = contrib.sum(dim=1)        # (B,)
+            sentence_len = mask.sum(dim=1).clamp(min=1.0)  # (B,)
+            hessian_per_sentence = sentence_sum / sentence_len  # (B,)
+            
+            return hessian_per_sentence
+        
+        def compute_hessian_global_level(g_sent, A, v, h, pi, mask, gather_fn):
+            g_global = gather_fn(g_sent).mean(0)                   # [D]
+            B, T, V = v.shape
+            H = h.shape[-1]
+
+            # Step 1: Reshape g_global to (V, H)
+            G = g_global.view(V, H)  # (V, H)
+
+            # Step 2: u = G @ h => shape (B, T, V)
+            u = torch.einsum('vh,bth->btv', G, h)
+
+            # Step 3: Compute per-sample contributions
+            contrib = compute_per_sample_hessian_contributions(u, A, v, pi)
+
+            # Step 4: Masked sentence-level average
+            contrib = contrib * mask         # (B, T)
+            sentence_sum = contrib.sum(dim=1)        # (B,)
+            sentence_len = mask.sum(dim=1).clamp(min=1.0)  # (B,)
+            hessian_per_sentence = sentence_sum / sentence_len  # (B,)
+
+            # Step 5: Global-level average
+            hessian_global = gather_fn(hessian_per_sentence).mean() # (1,)
+            
+            return hessian_global, g_global
+
+        
+        def compute_hessian_inference_wrapper(compute_fn, allow_grad):
+            if allow_grad:
+                return compute_fn()
+            else:
+                with torch.inference_mode():
+                    return compute_fn()
+
         # Helper function to encapsulate the calculations and logging
-        def _compute_rayleigh_coefficient():
-            # Original content of the calculations and logging
-            seq_len = softmax_probs.shape[1]
-            features = hidden_states[-1, :, -seq_len:, :]  # [batch, seq, hidden_dim]
-            feature_norm_sq = torch.norm(features, dim=-1) ** 2  # [batch, seq]
+        def _compute_hessian_coefficients(hessian_grad_fn=None):
+            gather_fn = self.accelerator.gather
+            # === Dimensions ===
+            # B: batch_size, T: seq_len, V: vocab_size, H: hidden_dim, D: V * H
+            batch_size, seq_len, vocab_size = softmax_probs.shape
+            hidden_dim = hidden_states[-1].shape[-1]
+            D = vocab_size * hidden_dim  # flattened feature dimension
 
-            pi = softmax_probs  # [batch, seq, vocab]
-            e_a = one_hot_actions  # [batch, seq, vocab]
-            v = e_a - pi  # [batch, seq, vocab]
+            # === 1. Extract final layer hidden states and policy info ===
+            h = hidden_states[-1, :, -seq_len:, :]             # [B, T, H]
+            pi = softmax_probs                                 # [B, T, V]
+            e_a = one_hot_actions.to(h.dtype)                  # [B, T, V]
+            v = e_a - pi                                       # [B, T, V]
+            A = advantages.unsqueeze(1).to(h.dtype)            # [B, 1]
+            mask = completion_mask.to(h.dtype)                 # [B, T]
+            mask_f = mask.float().to(h.dtype)
+            mask_sum = mask_f.sum(dim=1).clamp(min=1).unsqueeze(-1)  # [B, 1]
+            
 
-            # Fisher Information Matrix projection: v^T F v
-            # Construct (e_i - pi): shape [batch, seq, vocab, vocab]
-            identity = torch.eye(pi.shape[-1], device=pi.device).unsqueeze(0).unsqueeze(0)  # [1, 1, vocab, vocab]
-            e_i_minus_pi = identity - pi.unsqueeze(-2)  # [batch, seq, vocab, vocab]
+            # === 2. Compute token-level gradients: φ = A * (v ⊗ h) ===
+            g = A.unsqueeze(-1).unsqueeze(-1) * v.unsqueeze(-1) * h.unsqueeze(2)  # [B, T, V, H]
+            g_flat = g.view(batch_size, seq_len, -1)                            # [B, T, D]
 
-            # Compute inner products v^T (e_i - pi) for all i
-            v_unsq = v.unsqueeze(-2)  # [batch, seq, 1, vocab]
-            inner_products = torch.matmul(v_unsq, e_i_minus_pi.transpose(-1, -2)).squeeze(-2)  # [batch, seq, vocab]
+            # === 3. Compute mean gradients ===
+            # Sentence level: mean over valid tokens
+            g_sent = (g_flat * mask_f.unsqueeze(-1)).sum(1) / mask_sum         # [B, D]
 
-            fisher_proj = (pi * inner_products ** 2).sum(dim=-1)  # [batch, seq]
-
-            # Compute ||v||^2
-            policy_error_norm_sq = (v ** 2).sum(dim=-1)  # [batch, seq]
-
-            # Compute final Rayleigh coefficient
-            # This is the value that will be returned and potentially used in the loss
-            calculated_rayleigh_coeff = advantages.unsqueeze(1) * (policy_error_norm_sq - fisher_proj) * feature_norm_sq  # [batch, seq]
-            abs_rayleigh_coeff = torch.abs(calculated_rayleigh_coeff)
-
-            grad_norm_sq = (advantages.unsqueeze(1)**2) * policy_error_norm_sq * feature_norm_sq
-            gathered_grad_norm_sq = self._gather_masked_tensor_across_processes(grad_norm_sq, completion_mask)
-
-            gathered_rayleigh_coeff = self._gather_masked_tensor_across_processes(calculated_rayleigh_coeff, completion_mask)
-
-            # ------------------------------- Per token metrics -------------------------------
-            self._accumulate_stats(
-                data=gathered_rayleigh_coeff,
-                metric_name='per_token_rayleigh_coeff',
-                mode=mode
+            # === 4. Compute hessian coefficient ===
+            hessian_token = compute_hessian_inference_wrapper(
+                lambda: compute_hessian_token_level(A, v, h, pi, g_flat, mask),
+                hessian_grad_fn == "token"
+            )
+            hessian_sentence = compute_hessian_inference_wrapper(
+                lambda: compute_hessian_sentence_level(g_sent, A, v, h, pi, mask, gather_fn),
+                hessian_grad_fn == "sentence"
+            )
+            hessian_global, g_global = compute_hessian_inference_wrapper(
+                lambda: compute_hessian_global_level(g_sent, A, v, h, pi, mask, gather_fn),
+                hessian_grad_fn == "global"
             )
 
-            self._accumulate_stats(
-                data=torch.abs(gathered_rayleigh_coeff),
-                metric_name='per_token_rayleigh_coeff_abs',
-                mode=mode
-            )
-
-            # log quadractic coefficient
+            # === 5. Compute full update term ===
             lr = self.lr_scheduler.get_last_lr()[0]
-            quadratic_coeff = 0.5 * gathered_rayleigh_coeff * lr**2
-            self._accumulate_stats(
-                data=quadratic_coeff,
-                metric_name='per_token_rayleigh_coeff_quadratic',
-                mode=mode
-            )
+            token_grad_norm_sq = torch.sum(g_flat ** 2, dim=-1)
+            sentence_grad_norm_sq = torch.sum(g_sent ** 2, dim=-1)
+            global_grad_norm_sq = torch.sum(g_global ** 2, dim=-1)
 
-            # log quadratic term
-            quadratic_term = gathered_grad_norm_sq * quadratic_coeff
-            self._accumulate_stats(
-                data=quadratic_term,
-                metric_name='per_token_quadratic_term',
-                mode=mode
-            )
 
-            # log full update term
-            full_update_term = - lr * gathered_grad_norm_sq + quadratic_term
-            self._accumulate_stats(
-                data=full_update_term,
-                metric_name='per_token_full_update_term',
-                mode=mode
-            )
+            full_token_update_term = lr * token_grad_norm_sq + token_grad_norm_sq * 0.5 * hessian_token * lr**2
+            full_sentence_update_term = lr * sentence_grad_norm_sq + sentence_grad_norm_sq * 0.5 * hessian_sentence * lr**2
+            full_global_update_term = lr * global_grad_norm_sq + global_grad_norm_sq * 0.5 * hessian_global * lr**2
 
-            # ------------------------------- Per sentence metrics -------------------------------
-            mean_rayleigh = (calculated_rayleigh_coeff * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)
-            mean_grad_norm_sq = (grad_norm_sq * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)
+            # === 6. Log stats ===
+            log_hessian_stats(hessian_global.unsqueeze(0).float(), g_global.float(), mode, f"{prefix}_global" if prefix else "global")
+            log_hessian_stats(hessian_sentence, g_sent, mode, f"{prefix}_per_sentence" if prefix else "per_sentence", gather_fn=lambda t: self.accelerator.gather(t).float())
+            log_hessian_stats(hessian_token, g_flat, mode, f"{prefix}_per_token" if prefix else "per_token", gather_fn=lambda t: self._gather_masked_tensor_across_processes(t, completion_mask).float())
 
-            gathered_mean_rayleigh = self.accelerator.gather(mean_rayleigh)
-            gathered_mean_grad_norm_sq = self.accelerator.gather(mean_grad_norm_sq)
+            hessian_stats = {
+                "global": hessian_global,
+                "sentence": hessian_sentence,
+                "token": hessian_token,
+            }
+            full_update_stats = {
+                "global": full_global_update_term,
+                "sentence": full_sentence_update_term,
+                "token": full_token_update_term,
+            }
+            return hessian_stats, full_update_stats
+        
+        def log_hessian_stats(hessian_coeff, grad, mode, metric_prefix, gather_fn=None):
+            if gather_fn is not None:
+                gathered_hessian_coeff = gather_fn(hessian_coeff)
+            else:
+                gathered_hessian_coeff = hessian_coeff
+            
             self._accumulate_stats(
-                data=gathered_mean_rayleigh,
-                metric_name='per_sentence_rayleigh_coeff',
+                data=gathered_hessian_coeff,
+                metric_name=f'{metric_prefix}_hessian_coeff',
                 mode=mode,
                 stats={
                     **DEFAULT_STATS,
@@ -650,53 +742,289 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
                     'p90': lambda x: x.quantile(0.9).item(),
                     'p95': lambda x: x.quantile(0.95).item(),
                     'p99': lambda x: x.quantile(0.99).item(),
-                    'p1': lambda x: x.quantile(0.01).item(),
-                    'p5': lambda x: x.quantile(0.05).item(),
-                },
+                }
             )
 
             self._accumulate_stats(
-                data=torch.abs(gathered_mean_rayleigh),
-                metric_name='per_sentence_rayleigh_coeff_abs',
-                mode=mode
+                data=torch.abs(gathered_hessian_coeff),
+                metric_name=f'{metric_prefix}_hessian_coeff_abs',
+                mode=mode,
+                stats={
+                    **DEFAULT_STATS,
+                    'p85': lambda x: x.quantile(0.85).item(),
+                    'p90': lambda x: x.quantile(0.9).item(),
+                    'p95': lambda x: x.quantile(0.95).item(),
+                    'p99': lambda x: x.quantile(0.99).item(),
+                }
             )
 
-            # log quadratic coefficient
-            quadratic_coeff = 0.5 * gathered_mean_rayleigh * lr**2
+            # log quadractic coefficient
+            lr = self.lr_scheduler.get_last_lr()[0]
+            quadratic_coeff = 0.5 * gathered_hessian_coeff * lr**2
             self._accumulate_stats(
                 data=quadratic_coeff,
-                metric_name='per_sentence_rayleigh_coeff_quadratic',
-                mode=mode
+                metric_name=f'{metric_prefix}_hessian_coeff_quadratic_coeff',
+                mode=mode,
+                stats={
+                    **DEFAULT_STATS,
+                    'p85': lambda x: x.quantile(0.85).item(),
+                    'p90': lambda x: x.quantile(0.9).item(),
+                    'p95': lambda x: x.quantile(0.95).item(),
+                    'p99': lambda x: x.quantile(0.99).item(),
+                }
             )
-
             # log quadratic term
-            quadratic_term = gathered_mean_grad_norm_sq * quadratic_coeff
+            grad_norm_sq = torch.sum(grad ** 2, dim=-1)
+            if gather_fn is not None:
+                grad_norm_sq = gather_fn(grad_norm_sq)
+            quadratic_term = grad_norm_sq * quadratic_coeff
             self._accumulate_stats(
                 data=quadratic_term,
-                metric_name='per_sentence_quadratic_term',
-                mode=mode
+                metric_name=f'{metric_prefix}_hessian_coeff_quadratic_term',
+                mode=mode,
+                stats={
+                    **DEFAULT_STATS,
+                    'p85': lambda x: x.quantile(0.85).item(),
+                    'p90': lambda x: x.quantile(0.9).item(),
+                    'p95': lambda x: x.quantile(0.95).item(),
+                    'p99': lambda x: x.quantile(0.99).item(),
+                }
             )
 
             # log full update term
-            full_update_term = - lr * gathered_mean_grad_norm_sq + quadratic_term
+            full_update_term = lr * grad_norm_sq + quadratic_term
             self._accumulate_stats(
                 data=full_update_term,
-                metric_name='per_sentence_full_update_term',
-                mode=mode
+                metric_name=f'{metric_prefix}_full_update_term',
+                mode=mode,
+                stats={
+                    **DEFAULT_STATS,
+                    'p85': lambda x: x.quantile(0.85).item(),
+                    'p90': lambda x: x.quantile(0.9).item(),
+                    'p95': lambda x: x.quantile(0.95).item(),
+                    'p99': lambda x: x.quantile(0.99).item(),
+                }
             )
 
-            return abs_rayleigh_coeff
-
-        if self.rayleigh_lambda == 0.0:
+        if self.curvature_lambda == 0.0:
             # If lambda is 0, compute in inference mode to save resources
             with torch.inference_mode():
-                rayleigh_coeff = _compute_rayleigh_coefficient()
+                hessian_coeff = _compute_hessian_coefficients(self.curvature_reg_fn)
         else:
             # If lambda is non-zero, compute normally to allow for gradients
-            rayleigh_coeff = _compute_rayleigh_coefficient()
+            hessian_coeff = _compute_hessian_coefficients()
             
-        return rayleigh_coeff
+        return hessian_coeff
+    
 
+    def _compute_and_log_fisher_curvature(self, hidden_states, one_hot_actions, softmax_probs, advantages, completion_mask, mode, prefix=""):
+        """
+        Compute the Fisher curvature for each token in the sequence. We compute g^T F g, where F is the Fisher information matrix.
+        """
+        def compute_fisher_token_level(g_flat, v, h, mask):
+            """
+            Per-token Fisher curvature.
+            
+            Args:
+                v: [B, T, V]
+                h: [B, T, H]
+                g_flat: [B, T, V * H]
+            
+            Returns:
+                curvature: [B, T]
+            """
+            B, T, V = v.shape
+            H = h.shape[-1]
+
+            G = g_flat.view(B, T, V, H)  # [B, T, V, H]
+            # einsum over batch and time
+            s = torch.einsum('btv,btvh,bth->bt', v, G, h)
+            return s ** 2
+        
+        def compute_fisher_sentence_level(g_sent, v, h, mask, gather_fn):
+            """
+            Per-sentence Fisher curvature.
+            
+            Args:
+                v: [B, T, V]
+                h: [B, T, H]
+                g_flat: [B, V * H]
+            
+            Returns:
+                curvature: [B]
+            """
+            B, T, V = v.shape
+            H = h.shape[-1]
+
+            G = g_sent.view(B, V, H)  # [B, V, H]
+            # einsum over batch only
+            s = torch.einsum('btv,bvh,bth->bt', v, G, h)  # [B, T]
+
+            fisher = s ** 2
+            # mask and average over time
+            fisher = fisher * mask  # [B, T]
+            fisher = fisher.sum(dim=1)  # [B]
+            fisher = fisher / mask.sum(dim=1).clamp(min=1.0)  # [B]
+            return fisher  # [B]
+        
+        def compute_fisher_global_level(g_sent, v, h, mask, gather_fn):
+            """
+            Global Fisher curvature with a single gradient direction.
+            
+            Args:
+                v: [B, T, V]
+                h: [B, T, H]
+                g_flat: [V * H]
+            
+            Returns:
+                curvature: scalar
+            """
+            B, T, V = v.shape
+            H = h.shape[-1]
+            g_global = gather_fn(g_sent).mean(0)    
+
+            G = g_global.view(V, H)  # [V, H]
+            # einsum globally
+            s = torch.einsum('btv,vh,bth->bt', v, G, h)  # [B, T]
+
+            fisher = s ** 2
+            fisher = fisher * mask  # [B, T]
+            fisher = fisher.sum(dim=1)  # [B]
+            fisher = fisher / mask.sum(dim=1).clamp(min=1.0)  # [B]
+
+            # global average
+            return gather_fn(fisher).mean()  # scalar
+
+        def compute_fisher_inference_wrapper(compute_fn, allow_grad):
+            if allow_grad:
+                return compute_fn()
+            else:
+                with torch.inference_mode():
+                    return compute_fn()
+
+        # Helper function to encapsulate the calculations and logging
+        def _compute_fisher_curvatures(fisher_grad_fn=None):
+            gather_fn = self.accelerator.gather
+            # === Dimensions ===
+            # B: batch_size, T: seq_len, V: vocab_size, H: hidden_dim, D: V * H
+            batch_size, seq_len, vocab_size = softmax_probs.shape
+            hidden_dim = hidden_states[-1].shape[-1]
+            D = vocab_size * hidden_dim  # flattened feature dimension
+
+            # === 1. Extract final layer hidden states and policy info ===
+            h = hidden_states[-1, :, -seq_len:, :]             # [B, T, H]
+            pi = softmax_probs                                 # [B, T, V]
+            e_a = one_hot_actions.to(h.dtype)                  # [B, T, V]
+            v = e_a - pi                                       # [B, T, V]
+            A = advantages.unsqueeze(1).to(h.dtype)            # [B, 1]
+            mask = completion_mask.to(h.dtype)                 # [B, T]
+            mask_f = mask.float().to(h.dtype)
+            mask_sum = mask_f.sum(dim=1).clamp(min=1).unsqueeze(-1)  # [B, 1]
+            
+
+            # === 2. Compute token-level gradients: φ = A * (v ⊗ h) ===
+            g = A.unsqueeze(-1).unsqueeze(-1) * v.unsqueeze(-1) * h.unsqueeze(2)  # [B, T, V, H]
+            g_flat = g.view(batch_size, seq_len, -1)                            # [B, T, D]
+
+            # === 3. Compute mean gradients ===
+            # Sentence level: mean over valid tokens
+            g_sent = (g_flat * mask_f.unsqueeze(-1)).sum(1) / mask_sum         # [B, D]
+
+            # === 4. Compute Fisher curvature ===
+            fisher_token = compute_fisher_inference_wrapper(
+                lambda: compute_fisher_token_level(g_flat, v, h, mask),
+                fisher_grad_fn == "token"
+            )
+            fisher_sentence = compute_fisher_inference_wrapper(
+                lambda: compute_fisher_sentence_level(g_sent, v, h, mask, gather_fn),
+                fisher_grad_fn == "sentence"
+            )
+            fisher_global = compute_fisher_inference_wrapper(
+                lambda: compute_fisher_global_level(g_sent, v, h, mask, gather_fn),
+                fisher_grad_fn == "global"
+            )
+
+            # KL divergence
+            lr = self.lr_scheduler.get_last_lr()[0]
+            kl_token = 0.5 * fisher_token * lr**2
+            kl_sentence = 0.5 * fisher_sentence * lr**2
+            kl_global = 0.5 * fisher_global * lr**2
+
+            # === 5. Log stats ===
+            log_fisher_stats(fisher_global.unsqueeze(0).float(), mode, f"{prefix}_global" if prefix else "global")
+            log_fisher_stats(fisher_sentence, mode, f"{prefix}_per_sentence" if prefix else "per_sentence", gather_fn=lambda t: self.accelerator.gather(t).float())
+            log_fisher_stats(fisher_token, mode, f"{prefix}_per_token" if prefix else "per_token", gather_fn=lambda t: self._gather_masked_tensor_across_processes(t, completion_mask).float())
+
+            curvature_stats = {
+                "global": fisher_global,
+                "sentence": fisher_sentence,
+                "token": fisher_token,
+            }
+            
+            kl_stats = {
+                "global": kl_global,
+                "sentence": kl_sentence,
+                "token": kl_token,
+            }
+            return curvature_stats, kl_stats
+        
+        def log_fisher_stats(fisher_curvature, mode, metric_prefix, gather_fn=None):
+            if gather_fn is not None:
+                gathered_fisher_curvature = gather_fn(fisher_curvature)
+            else:
+                gathered_fisher_curvature = fisher_curvature
+            
+            self._accumulate_stats(
+                data=gathered_fisher_curvature,
+                metric_name=f'{metric_prefix}_fisher_curvature',
+                mode=mode,
+                stats={
+                    **DEFAULT_STATS,
+                    'p85': lambda x: x.quantile(0.85).item(),
+                    'p90': lambda x: x.quantile(0.9).item(),
+                    'p95': lambda x: x.quantile(0.95).item(),
+                    'p99': lambda x: x.quantile(0.99).item(),
+                }
+            )
+
+            self._accumulate_stats(
+                data=torch.abs(gathered_fisher_curvature),
+                metric_name=f'{metric_prefix}_fisher_curvature_abs',
+                mode=mode,
+                stats={
+                    **DEFAULT_STATS,
+                    'p85': lambda x: x.quantile(0.85).item(),
+                    'p90': lambda x: x.quantile(0.9).item(),
+                    'p95': lambda x: x.quantile(0.95).item(),
+                    'p99': lambda x: x.quantile(0.99).item(),
+                }
+            )
+
+            # log quadractic coefficient
+            lr = self.lr_scheduler.get_last_lr()[0]
+            kl_divergence = 0.5 * gathered_fisher_curvature * lr**2
+            self._accumulate_stats(
+                data=kl_divergence,
+                metric_name=f'{metric_prefix}_fisher_kl_divergence',
+                mode=mode,
+                stats={
+                    **DEFAULT_STATS,
+                    'p85': lambda x: x.quantile(0.85).item(),
+                    'p90': lambda x: x.quantile(0.9).item(),
+                    'p95': lambda x: x.quantile(0.95).item(),
+                    'p99': lambda x: x.quantile(0.99).item(),
+                }
+            )
+
+        if self.curvature_lambda == 0.0:
+            # If lambda is 0, compute in inference mode to save resources
+            with torch.inference_mode():
+                fisher_curvatures, approx_kl = _compute_fisher_curvatures(self.curvature_reg_fn)
+        else:
+            # If lambda is non-zero, compute normally to allow for gradients
+            fisher_curvatures, approx_kl = _compute_fisher_curvatures()
+            
+        return fisher_curvatures, approx_kl
     
     def _smooth_logprobs(self, logprobs):
         return torch.nn.functional.softplus(logprobs +  self.softplus_alpha) - self.softplus_alpha
@@ -894,15 +1222,25 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
 
         return advantages
     
-    def _compute_final_loss(self, per_token_loss, completion_mask):
-        z = completion_mask.sum(dim=1)
-        per_sentence_loss = per_token_loss * completion_mask
-        loss_1 = per_sentence_loss.sum(dim=1) / z
-        loss_avg_1 = loss_1.mean()
-
-        gather_loss_1 = self.accelerator.gather_for_metrics(loss_1)
+    def _compute_final_loss(self, per_token_loss, completion_mask, curvature_estimator):
         mode = "eval" if self.control.should_evaluate else "train"
+        # --- Token-level adjustments ---
+        if curvature_estimator:
+            per_token_loss, completion_mask = self._apply_curvature_regularization(per_token_loss, curvature_estimator["token"], "token", mode, mask=completion_mask)
 
+        # --- Sentence-level loss calculation ---
+        z = completion_mask.sum(dim=1).clamp(min=1)
+        per_sentence_loss = (per_token_loss * completion_mask).sum(dim=1) / z
+
+        # --- Sentence and Global-level adjustments ---
+        if curvature_estimator:
+            for level in ["sentence", "global"]:
+                coeff = curvature_estimator[level]
+                per_sentence_loss, _ = self._apply_curvature_regularization(per_sentence_loss, coeff, level, mode, mask=completion_mask)
+                
+        loss_avg_1 = per_sentence_loss.mean()
+        gather_loss_1 = self.accelerator.gather_for_metrics(per_sentence_loss)
+        
         self._accumulate_stats(
             data=gather_loss_1,
             metric_name='policy_loss',
@@ -912,6 +1250,41 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
         # Old, buggy loss
         loss_2 = (per_token_loss * completion_mask).sum() / completion_mask.sum()
         return loss_avg_1
+    
+    def _apply_curvature_regularization(self, loss, coeff, level, mode, mask=None):
+        final_mask = mask
+
+        # Regularization
+        if self.curvature_lambda != 0.0 and self.curvature_reg_fn == level:
+            loss = loss + self.curvature_lambda * coeff
+
+        # Masking
+        if self.curvature_mask_tau != 0.0 and self.curvature_mask_fn == level:
+            curvature_mask = coeff < self.curvature_mask_tau
+            loss = loss * curvature_mask.float()
+
+            # Clip ratio logging
+            if level == "token":
+                total_tokens = mask.sum().clamp(min=1)
+                clipped_tokens = (~curvature_mask * mask).sum()
+                final_mask = mask * curvature_mask.float()
+            elif level == "sentence":
+                total_tokens = mask.sum().clamp(min=1)
+                clipped_tokens = (~curvature_mask.unsqueeze(1) * mask).sum()
+                final_mask = mask * curvature_mask.unsqueeze(1).float()
+            else:  # global
+                total_tokens = torch.tensor(mask.sum().item(), device=loss.device).clamp(min=1)
+                clipped_tokens = (~curvature_mask) * mask.sum()
+                final_mask = mask * curvature_mask.float()
+            
+            clip_ratio = clipped_tokens / total_tokens
+            metric_key = f"curvature_clip_ratio_{level}_{self.curvature_estimator}"
+            if metric_key not in self._metrics[mode]:
+                self._metrics[mode][metric_key] = []
+            self._metrics[mode][metric_key].append(
+                self.accelerator.gather_for_metrics(clip_ratio).mean().item()
+            )
+        return loss, final_mask
 
     
     def _log_stats(self, stats_dict, mode):
@@ -1293,6 +1666,11 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
 
         # Pad local tensor to max length across processes
         max_length = gathered_lengths.max().item()
+
+        # if max_length is 0, return an empty tensor
+        if max_length == 0:
+            return torch.tensor([], device=flat_tensor.device)
+
         padded_flat_tensor = torch.nn.functional.pad(
             flat_tensor,
             (0, max_length - flat_tensor.shape[0]),

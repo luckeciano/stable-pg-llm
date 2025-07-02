@@ -28,13 +28,19 @@ export PYTHONWARNINGS="ignore::DeprecationWarning"
 source /scratch-ssd/oatml/miniconda3/bin/activate maxent-r1-lucelo
 
 # Installing flash-attn
-pip install flash-attn --no-build-isolation
+pip install flash-attn==2.7.4.post1 --no-build-isolation
 
 cd ~/maxent-rl-r1
 echo "pwd: $(pwd)"
 pip install --no-cache-dir --upgrade pip
 pip install --no-cache-dir -e ".[dev]"
 
+# If there is "reasoning-gym" in home, install it. Otherwise, install from github.
+if [ -d "~/reasoning-gym" ]; then
+    pip install --no-cache-dir -e ~/reasoning-gym
+else
+    pip install --no-cache-dir -e https://github.com/max-ent-llms/reasoning-gym.git
+fi
 echo $TMPDIR
 
 nvidia-smi
