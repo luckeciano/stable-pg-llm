@@ -75,11 +75,19 @@ class GRPOConfig(trl.GRPOConfig):
     entropy_estimator: str = field(default="logprobs", metadata={"help": "The estimator for the entropy loss. Possible values: logprobs, entropy."})
 
     # Rayleigh
-    curvature_lambda: float = field(default=0.0, metadata={"help": "The lambda for the rayleigh loss."})
-    curvature_mask_tau: float = field(default=0.0, metadata={"help": "The tau for the rayleigh mask."})
-    curvature_reg_fn: str = field(default=None, metadata={"help": "The function to use for the rayleigh regularization. Possible values: global, token, sentence."})
-    curvature_mask_fn: str = field(default=None, metadata={"help": "The function to use for the rayleigh mask. Possible values: global, token, sentence."})
-    curvature_estimator: str = field(default="hessian", metadata={"help": "The estimator for the rayleigh loss. Possible values: hessian, fisher."})
+    hessian_token_lambda: float = field(default=0.0, metadata={"help": "The regularization coefficient for the hessian loss at token level."})
+    fisher_token_lambda: float = field(default=0.0, metadata={"help": "The regularization coefficient for the fisher loss at token level."})
+    hessian_sentence_lambda: float = field(default=0.0, metadata={"help": "The regularization coefficient for the hessian loss at sentence level."})
+    fisher_sentence_lambda: float = field(default=0.0, metadata={"help": "The regularization coefficient for the fisher loss at sentence level."})
+    hessian_global_lambda: float = field(default=0.0, metadata={"help": "The regularization coefficient for the hessian loss at global level."})
+    fisher_global_lambda: float = field(default=0.0, metadata={"help": "The regularization coefficient for the fisher loss at global level."})
+    hessian_token_mask_tau: float = field(default=0.0, metadata={"help": "The masking coefficient for the hessian at token level."})
+    fisher_token_mask_tau: float = field(default=0.0, metadata={"help": "The masking coefficient for the fisher at token level."})
+    hessian_sentence_mask_tau: float = field(default=0.0, metadata={"help": "The masking coefficient for the hessian at sentence level."})
+    fisher_sentence_mask_tau: float = field(default=0.0, metadata={"help": "The masking coefficient for the fisher at sentence level."})
+    hessian_global_mask_tau: float = field(default=0.0, metadata={"help": "The masking coefficient for the hessian at global level."})
+    fisher_global_mask_tau: float = field(default=0.0, metadata={"help": "The masking coefficient for the fisher at global level."})
+
 
 
 

@@ -103,6 +103,7 @@ class AdamStatsLogger(TrainerCallback):
                 if m is not None and v is not None:
                     # Adam's effective learning rate: lr * m_t / (sqrt(v_t) + eps)
                     effective_lr = (lr * m / (v.sqrt() + eps)).detach().flatten()
+                    
                     m_vals.append(m.detach().flatten())
                     v_vals.append(v.detach().flatten())
                     effective_lrs.append(effective_lr)
@@ -125,6 +126,31 @@ class AdamStatsLogger(TrainerCallback):
         self.trainer._metrics["adam_stats/lr_effective_min"] = effective_lrs_cat.min().item()
         self.trainer._metrics["adam_stats/lr_effective_max"] = effective_lrs_cat.max().item()
 
+        self.log_lm_head_lr(optimizer, model.lm_head.in_features, model.lm_head.out_features)
+
+    def log_lm_head_lr(self, optimizer, in_features, out_features):
+        expected_numel = in_features * out_features
+
+        for group in optimizer.param_groups:
+            flat_param = group['params'][0]  # ZeRO-2 flattens all into one
+            if flat_param.numel() < expected_numel:
+                raise ValueError("Flattened param tensor too small")
+            
+            eps = group["eps"]
+            state_dict = optimizer.state[flat_param]
+            m = state_dict.get("exp_avg", None)
+            v = state_dict.get("exp_avg_sq", None)
+
+            # Adam's effective learning rate: lr * m_t / (sqrt(v_t) + eps)
+            effective_lr = (group["lr"] * m / (v.sqrt() + eps)).detach().flatten()
+
+            effective_lr = effective_lr[:expected_numel]
+
+            self.trainer._metrics["adam_stats/lm_head/lr_effective_mean"] = effective_lr.mean().item()
+            self.trainer._metrics["adam_stats/lm_head/lr_effective_min"] = effective_lr.min().item()
+            self.trainer._metrics["adam_stats/lm_head/lr_effective_max"] = effective_lr.max().item()
+            self.trainer._metrics["adam_stats/lm_head/lr_effective_std"] = effective_lr.std().item()
+            return
 
 CALLBACKS = {
     "push_to_hub_revision": PushToHubRevisionCallback,

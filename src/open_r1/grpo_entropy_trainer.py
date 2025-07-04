@@ -6,6 +6,9 @@ import torch.nn as nn
 import pandas as pd
 import numpy as np
 import wandb
+import io
+import tempfile
+import os
 from tqdm import tqdm
 from packaging import version
 from torch.utils.data import DataLoader, Sampler
@@ -70,12 +73,24 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
         self.smooth_logprobs = kwargs['args'].smooth_logprobs
         self.softplus_alpha = kwargs['args'].softplus_alpha
         self.entropy_estimator = kwargs['args'].entropy_estimator
-        self.curvature_lambda = kwargs['args'].curvature_lambda
-        self.curvature_mask_tau = kwargs['args'].curvature_mask_tau
-        self.curvature_reg_fn = kwargs['args'].curvature_reg_fn
-        self.curvature_mask_fn = kwargs['args'].curvature_mask_fn
-        self.curvature_estimator = kwargs['args'].curvature_estimator
         self.advantage_target_std = kwargs['args'].advantage_target_std
+
+        self.hessian_token_lambda = kwargs['args'].hessian_token_lambda
+        self.fisher_token_lambda = kwargs['args'].fisher_token_lambda
+        self.hessian_sentence_lambda = kwargs['args'].hessian_sentence_lambda
+        self.fisher_sentence_lambda = kwargs['args'].fisher_sentence_lambda
+        self.hessian_global_lambda = kwargs['args'].hessian_global_lambda
+        self.fisher_global_lambda = kwargs['args'].fisher_global_lambda
+
+        self.hessian_token_mask_tau = kwargs['args'].hessian_token_mask_tau
+        self.fisher_token_mask_tau = kwargs['args'].fisher_token_mask_tau
+        self.hessian_sentence_mask_tau = kwargs['args'].hessian_sentence_mask_tau
+        self.fisher_sentence_mask_tau = kwargs['args'].fisher_sentence_mask_tau
+        self.hessian_global_mask_tau = kwargs['args'].hessian_global_mask_tau
+        self.fisher_global_mask_tau = kwargs['args'].fisher_global_mask_tau
+        self.curvature_masking = any([self.hessian_token_mask_tau, self.fisher_token_mask_tau, self.hessian_sentence_mask_tau, \
+                                      self.fisher_sentence_mask_tau, self.hessian_global_mask_tau, self.fisher_global_mask_tau])
+
 
     def _get_and_smooth_token_logps(self, model, input_ids, attention_mask, logits_to_keep, mode, return_hidden_states=False, return_entropy=False):
         per_token_logps, entropy, embeddings, probs, action_one_hot = self._get_per_token_logps(model, input_ids, attention_mask, logits_to_keep, return_hidden_states=return_hidden_states, return_entropy=return_entropy)
@@ -240,15 +255,12 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
         fisher_curvature, approx_kl = self._compute_and_log_fisher_curvature(hidden_states, action_one_hot, probs, inputs["advantages"], completion_mask, mode)
         self._compute_and_log_softmax_probs_stats(probs, completion_mask, mode)
 
-        if self.curvature_estimator == "hessian" and self.curvature_mask_tau != 0.0:
-            curvature_mask = (full_update_term[self.curvature_mask_fn] < self.curvature_mask_tau)
-            curvature_mask = curvature_mask if curvature_mask.shape == completion_mask.shape else curvature_mask.unsqueeze(-1).expand_as(completion_mask)
-            updated_mask = completion_mask * curvature_mask
+        if self.curvature_masking:
+            curvature_mask_hessian, _ = self._compute_hessian_curvature_mask(full_update_term, completion_mask)
+            curvature_mask_fisher, _ = self._compute_fisher_curvature_mask(approx_kl, completion_mask)
+            updated_mask = completion_mask * curvature_mask_hessian * curvature_mask_fisher
+
             self._compute_and_log_hessian_coefficient(hidden_states, action_one_hot, probs, inputs["advantages"], updated_mask, mode, prefix="masked")
-        elif self.curvature_estimator == "fisher" and self.curvature_mask_tau != 0.0:
-            curvature_mask = (approx_kl[self.curvature_mask_fn] < self.curvature_mask_tau)
-            curvature_mask = curvature_mask if curvature_mask.shape == completion_mask.shape else curvature_mask.unsqueeze(-1).expand_as(completion_mask)
-            updated_mask = completion_mask * curvature_mask
             self._compute_and_log_fisher_curvature(hidden_states, action_one_hot, probs, inputs["advantages"], updated_mask, mode, prefix="masked")
 
         gathered_entropy = self._gather_masked_tensor_across_processes(entropy, completion_mask)
@@ -294,13 +306,13 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
             else:
                 raise ValueError(f"Invalid entropy estimator: {self.entropy_estimator}")
 
-        curvature_estimator = None
-        if self.curvature_estimator == "hessian":
-            curvature_estimator = full_update_term
-        elif self.curvature_estimator == "fisher":
-            curvature_estimator = approx_kl
+        curvature_estimator = {}
+        if full_update_term is not None:
+            curvature_estimator["hessian"] = full_update_term
+        if approx_kl is not None:
+            curvature_estimator["fisher"] = approx_kl
         
-        loss = self._compute_final_loss(per_token_loss, completion_mask, curvature_estimator)
+        loss = self._compute_final_loss(per_token_loss, completion_mask, curvature_estimator, completion_ids)
 
         if self.beta != 0.0:
             mean_kl = ((per_token_kl * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
@@ -323,6 +335,55 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
         self._metrics[mode]["clip_ratio"].append(self.accelerator.gather_for_metrics(clip_ratio).mean().item())
         return loss
     
+    def _compute_hessian_curvature_mask(self, full_update_term, completion_mask):
+        curvature_mask = torch.ones_like(completion_mask)
+
+        if full_update_term is None:
+            return curvature_mask, { "total": curvature_mask }
+
+        masks = {}
+        if self.hessian_token_mask_tau != 0.0:
+            curvature_mask_token = (full_update_term["token"] < self.hessian_token_mask_tau) * (full_update_term["token"] >= 0.0)
+            masks["token"] = curvature_mask_token
+            curvature_mask = curvature_mask * curvature_mask_token
+        
+        if self.hessian_sentence_mask_tau != 0.0:
+            curvature_mask_sentence = ((full_update_term["sentence"] < self.hessian_sentence_mask_tau) * (full_update_term["sentence"] >= 0.0)).unsqueeze(-1).expand_as(completion_mask)
+            masks["sentence"] = curvature_mask_sentence
+            curvature_mask = curvature_mask * curvature_mask_sentence
+
+        if self.hessian_global_mask_tau != 0.0:
+            curvature_mask_global = ((full_update_term["global"] < self.hessian_global_mask_tau) * (full_update_term["global"] >= 0.0)).unsqueeze(-1).expand_as(completion_mask)
+            masks["global"] = curvature_mask_global
+            curvature_mask = curvature_mask * curvature_mask_global
+
+        masks["total"] = curvature_mask
+        return curvature_mask, masks
+    
+    def _compute_fisher_curvature_mask(self, approx_kl, completion_mask):
+        curvature_mask = torch.ones_like(completion_mask)
+
+        if approx_kl is None:
+            return curvature_mask, { "total": curvature_mask }
+
+        masks = {}
+        if self.fisher_token_mask_tau != 0.0:
+            curvature_mask_token = (approx_kl["token"] < self.fisher_token_mask_tau)
+            masks["token"] = curvature_mask_token
+            curvature_mask = curvature_mask * curvature_mask_token
+        
+        if self.fisher_sentence_mask_tau != 0.0:
+            curvature_mask_sentence = (approx_kl["sentence"] < self.fisher_sentence_mask_tau).unsqueeze(-1).expand_as(completion_mask)
+            masks["sentence"] = curvature_mask_sentence
+            curvature_mask = curvature_mask * curvature_mask_sentence
+
+        if self.fisher_global_mask_tau != 0.0:
+            curvature_mask_global = (approx_kl["global"] < self.fisher_global_mask_tau).unsqueeze(-1).expand_as(completion_mask)
+            masks["global"] = curvature_mask_global
+            curvature_mask = curvature_mask * curvature_mask_global
+
+        masks["total"] = curvature_mask
+        return curvature_mask, masks
 
     def _compute_and_log_softmax_probs_stats(self, softmax_probs, completion_mask, mode):
         # Compute sharpness
@@ -657,7 +718,7 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
                     return compute_fn()
 
         # Helper function to encapsulate the calculations and logging
-        def _compute_hessian_coefficients(hessian_grad_fn=None):
+        def _compute_hessian_coefficients():
             gather_fn = self.accelerator.gather
             # === Dimensions ===
             # B: batch_size, T: seq_len, V: vocab_size, H: hidden_dim, D: V * H
@@ -687,15 +748,15 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
             # === 4. Compute hessian coefficient ===
             hessian_token = compute_hessian_inference_wrapper(
                 lambda: compute_hessian_token_level(A, v, h, pi, g_flat, mask),
-                hessian_grad_fn == "token"
+                self.hessian_token_lambda != 0.0
             )
             hessian_sentence = compute_hessian_inference_wrapper(
                 lambda: compute_hessian_sentence_level(g_sent, A, v, h, pi, mask, gather_fn),
-                hessian_grad_fn == "sentence"
+                self.hessian_sentence_lambda != 0.0
             )
             hessian_global, g_global = compute_hessian_inference_wrapper(
                 lambda: compute_hessian_global_level(g_sent, A, v, h, pi, mask, gather_fn),
-                hessian_grad_fn == "global"
+                self.hessian_global_lambda != 0.0
             )
 
             # === 5. Compute full update term ===
@@ -806,10 +867,10 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
                 }
             )
 
-        if self.curvature_lambda == 0.0:
+        if self.hessian_global_lambda == 0.0 and self.hessian_sentence_lambda == 0.0 and self.hessian_token_lambda == 0.0:
             # If lambda is 0, compute in inference mode to save resources
             with torch.inference_mode():
-                hessian_coeff = _compute_hessian_coefficients(self.curvature_reg_fn)
+                hessian_coeff = _compute_hessian_coefficients()
         else:
             # If lambda is non-zero, compute normally to allow for gradients
             hessian_coeff = _compute_hessian_coefficients()
@@ -903,7 +964,7 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
                     return compute_fn()
 
         # Helper function to encapsulate the calculations and logging
-        def _compute_fisher_curvatures(fisher_grad_fn=None):
+        def _compute_fisher_curvatures():
             gather_fn = self.accelerator.gather
             # === Dimensions ===
             # B: batch_size, T: seq_len, V: vocab_size, H: hidden_dim, D: V * H
@@ -933,15 +994,15 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
             # === 4. Compute Fisher curvature ===
             fisher_token = compute_fisher_inference_wrapper(
                 lambda: compute_fisher_token_level(g_flat, v, h, mask),
-                fisher_grad_fn == "token"
+                self.fisher_token_lambda != 0.0
             )
             fisher_sentence = compute_fisher_inference_wrapper(
                 lambda: compute_fisher_sentence_level(g_sent, v, h, mask, gather_fn),
-                fisher_grad_fn == "sentence"
+                self.fisher_sentence_lambda != 0.0
             )
             fisher_global = compute_fisher_inference_wrapper(
                 lambda: compute_fisher_global_level(g_sent, v, h, mask, gather_fn),
-                fisher_grad_fn == "global"
+                self.fisher_global_lambda != 0.0
             )
 
             # KL divergence
@@ -1016,10 +1077,10 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
                 }
             )
 
-        if self.curvature_lambda == 0.0:
+        if self.fisher_global_lambda == 0.0 and self.fisher_sentence_lambda == 0.0 and self.fisher_token_lambda == 0.0:
             # If lambda is 0, compute in inference mode to save resources
             with torch.inference_mode():
-                fisher_curvatures, approx_kl = _compute_fisher_curvatures(self.curvature_reg_fn)
+                fisher_curvatures, approx_kl = _compute_fisher_curvatures()
         else:
             # If lambda is non-zero, compute normally to allow for gradients
             fisher_curvatures, approx_kl = _compute_fisher_curvatures()
@@ -1222,23 +1283,38 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
 
         return advantages
     
-    def _compute_final_loss(self, per_token_loss, completion_mask, curvature_estimator):
+    def _compute_final_loss(self, per_token_loss, completion_mask, curvature_estimator, completion_ids):
         mode = "eval" if self.control.should_evaluate else "train"
+        if self.curvature_masking:
+            curvature_mask_hessian, masks_hessian = self._compute_hessian_curvature_mask(curvature_estimator.get("hessian"), completion_mask)
+            curvature_mask_fisher, masks_fisher = self._compute_fisher_curvature_mask(curvature_estimator.get("fisher"), completion_mask)
+            self._log_masking_stats(masks_hessian, masks_fisher, completion_mask, completion_ids, mode)
+            
+            # Final mask
+            completion_mask = completion_mask * curvature_mask_hessian * curvature_mask_fisher
+
         # --- Token-level adjustments ---
-        if curvature_estimator:
-            per_token_loss, completion_mask = self._apply_curvature_regularization(per_token_loss, curvature_estimator["token"], "token", mode, mask=completion_mask)
+        if self.hessian_token_lambda != 0.0:
+            per_token_loss = per_token_loss + self.hessian_token_lambda * curvature_estimator['hessian']["token"]
+        if self.fisher_token_lambda != 0.0:
+            per_token_loss = per_token_loss + self.fisher_token_lambda * curvature_estimator['fisher']["token"]
 
         # --- Sentence-level loss calculation ---
         z = completion_mask.sum(dim=1).clamp(min=1)
         per_sentence_loss = (per_token_loss * completion_mask).sum(dim=1) / z
 
         # --- Sentence and Global-level adjustments ---
-        if curvature_estimator:
-            for level in ["sentence", "global"]:
-                coeff = curvature_estimator[level]
-                per_sentence_loss, _ = self._apply_curvature_regularization(per_sentence_loss, coeff, level, mode, mask=completion_mask)
+        if self.hessian_sentence_lambda != 0.0:
+            per_sentence_loss = per_sentence_loss + self.hessian_sentence_lambda * curvature_estimator['hessian']["sentence"]
+        if self.fisher_sentence_lambda != 0.0:
+            per_sentence_loss = per_sentence_loss + self.fisher_sentence_lambda * curvature_estimator['fisher']["sentence"]
                 
-        loss_avg_1 = per_sentence_loss.mean()
+        global_loss = per_sentence_loss.mean()
+        if self.hessian_global_lambda != 0.0:
+            global_loss = global_loss + self.hessian_global_lambda * curvature_estimator['hessian']["global"]
+        if self.fisher_global_lambda != 0.0:
+            global_loss = global_loss + self.fisher_global_lambda * curvature_estimator['fisher']["global"]
+
         gather_loss_1 = self.accelerator.gather_for_metrics(per_sentence_loss)
         
         self._accumulate_stats(
@@ -1247,45 +1323,115 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
             mode=mode,
         )
 
-        # Old, buggy loss
-        loss_2 = (per_token_loss * completion_mask).sum() / completion_mask.sum()
-        return loss_avg_1
-    
-    def _apply_curvature_regularization(self, loss, coeff, level, mode, mask=None):
-        final_mask = mask
+        return global_loss
 
-        # Regularization
-        if self.curvature_lambda != 0.0 and self.curvature_reg_fn == level:
-            loss = loss + self.curvature_lambda * coeff
+    def _log_masking_stats(self, masks_hessian, masks_fisher, completion_mask, completion_ids, mode):
+        full_mask = { "total": masks_fisher['total'] * masks_hessian['total'] }
 
-        # Masking
-        if self.curvature_mask_tau != 0.0 and self.curvature_mask_fn == level:
-            curvature_mask = coeff < self.curvature_mask_tau
-            loss = loss * curvature_mask.float()
+        for curvature_estimator in ["hessian", "fisher", "full"]:
+            masks = masks_fisher if curvature_estimator == "fisher" else masks_hessian if curvature_estimator == "hessian" else full_mask
+            if masks is None:
+                continue
+            for level in ["token", "sentence", "global", "total"]:
+                if level in masks:
+                    curvature_mask = masks[level].bool()
+                    total_tokens = completion_mask.sum().clamp(min=1)
+                    clipped_tokens = (~curvature_mask * completion_mask).sum()
+                    gathered_clipped_tokens = self.accelerator.gather_for_metrics(clipped_tokens).sum()
+                    gathered_total_tokens = self.accelerator.gather_for_metrics(total_tokens).sum()
+                    ratio = (gathered_clipped_tokens / (gathered_total_tokens + 1e-8)).item()
+                    metric_key = f"curvature_clip_ratio_{level}_{curvature_estimator}"
+                    if metric_key not in self._metrics[mode]:
+                        self._metrics[mode][metric_key] = []
+                    self._metrics[mode][metric_key].append(ratio)
 
-            # Clip ratio logging
-            if level == "token":
-                total_tokens = mask.sum().clamp(min=1)
-                clipped_tokens = (~curvature_mask * mask).sum()
-                final_mask = mask * curvature_mask.float()
-            elif level == "sentence":
-                total_tokens = mask.sum().clamp(min=1)
-                clipped_tokens = (~curvature_mask.unsqueeze(1) * mask).sum()
-                final_mask = mask * curvature_mask.unsqueeze(1).float()
-            else:  # global
-                total_tokens = torch.tensor(mask.sum().item(), device=loss.device).clamp(min=1)
-                clipped_tokens = (~curvature_mask) * mask.sum()
-                final_mask = mask * curvature_mask.float()
-            
-            clip_ratio = clipped_tokens / total_tokens
-            metric_key = f"curvature_clip_ratio_{level}_{self.curvature_estimator}"
-            if metric_key not in self._metrics[mode]:
-                self._metrics[mode][metric_key] = []
-            self._metrics[mode][metric_key].append(
-                self.accelerator.gather_for_metrics(clip_ratio).mean().item()
-            )
-        return loss, final_mask
+        self._log_masked_completions(self.processing_class,completion_ids, full_mask['total'], str(self.state.epoch))
+        self._log_masked_completions(self.processing_class,completion_ids, masks_fisher['total'], f"fisher_{str(self.state.epoch)}")
+        self._log_masked_completions(self.processing_class,completion_ids, masks_hessian['total'], f"hessian_{str(self.state.epoch)}")
 
+    def _log_masked_completions(self, tokenizer, completion_ids, completion_mask, name_suffix=""):
+        """
+        Logs three text files via wandb.Artifact:
+        1. Masked token IDs
+        2. Masked tokens (decoded)
+        3. Fully masked sentences (if any rows are fully masked)
+        """
+
+        gathered_completion_ids = self.accelerator.gather_for_metrics(completion_ids)
+        gathered_completion_mask = self.accelerator.gather_for_metrics(completion_mask)
+
+        B, T = gathered_completion_ids.shape
+
+        # Create in-memory string buffers
+        buf_ids = io.StringIO()
+        buf_tokens = io.StringIO()
+        buf_sentences = io.StringIO()
+
+        vocab_size = tokenizer.vocab_size
+
+        for b in range(B):
+            mask = gathered_completion_mask[b]
+            ids = gathered_completion_ids[b]
+            # Get tokens that are masked and not pad
+            masked_ids = ids[mask == 0]
+            masked_ids = masked_ids[masked_ids != tokenizer.pad_token_id]
+
+            for token_id in masked_ids:
+                token_id_val = token_id.item()
+                buf_ids.write(f"{token_id_val}\n")
+                
+                # Validate token ID is within valid range before decoding
+                if 0 <= token_id_val < vocab_size:
+                    try:
+                        decoded_token = tokenizer.decode([token_id_val], skip_special_tokens=True)
+                        buf_tokens.write(decoded_token + "\n")
+                    except Exception as e:
+                        # Log the error and skip this token
+                        buf_tokens.write(f"[INVALID_TOKEN_{token_id_val}]\n")
+                else:
+                    buf_tokens.write(f"[OUT_OF_RANGE_TOKEN_{token_id_val}]\n")
+
+            if mask.sum().item() == 0:
+                try:
+                    # Filter out invalid token IDs before decoding the full sequence
+                    valid_ids = [id_val.item() for id_val in ids if 0 <= id_val.item() < vocab_size]
+                    if valid_ids:
+                        decoded_sentence = tokenizer.decode(valid_ids, skip_special_tokens=True)
+                        buf_sentences.write(decoded_sentence + "\n")
+                    else:
+                        buf_sentences.write("[NO_VALID_TOKENS]\n")
+                except Exception as e:
+                    buf_sentences.write(f"[DECODE_ERROR: {str(e)}]\n")
+
+
+        # Rewind buffers
+        buf_ids.seek(0)
+        buf_tokens.seek(0)
+        buf_sentences.seek(0)
+
+        # Write to temp files
+        if self.accelerator.is_main_process:
+            temp_files = []
+            def write_temp_file(buf, filename):
+                tmp = tempfile.NamedTemporaryFile(mode="w+", suffix=".txt", delete=False)
+                tmp.write(buf.read())
+                tmp.flush()
+                temp_files.append((tmp.name, filename))
+
+            write_temp_file(buf_ids, f"masked_token_ids_{name_suffix}.txt")
+            write_temp_file(buf_tokens, f"masked_tokens_{name_suffix}.txt")
+            write_temp_file(buf_sentences, f"fully_masked_sentences_{name_suffix}.txt")
+
+            # Create and log artifact
+            artifact = wandb.Artifact(f"masked_tokens_{name_suffix}", type="mask_data")
+            for path, filename in temp_files:
+                artifact.add_file(path, name=filename)
+
+            wandb.run.log_artifact(artifact)
+
+            # Clean up
+            for path, _ in temp_files:
+                os.remove(path)
     
     def _log_stats(self, stats_dict, mode):
         rewards_per_func = stats_dict['rewards_per_func']
@@ -1577,7 +1723,7 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
                         for key, values in table.items():
                             if key in full_table:
                                 full_table[key].extend(values)
-                            else:
+                    else:
                                 full_table[key] = list(values)
 
                 # Log to wandb
