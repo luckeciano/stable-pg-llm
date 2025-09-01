@@ -1,12 +1,13 @@
 #!/bin/bash
 
 # Script to submit a sequence of training jobs with dependencies
-# Usage: ./submit_job_sequence.sh JOB_NAME MODEL TASK CONFIG_SUFFIX ACCELERATOR GPU_TYPE NUM_JOBS
+# Usage: ./submit_job_sequence.sh JOB_NAME MODEL TASK CONFIG_SUFFIX ACCELERATOR GPU_TYPE NUM_JOBS [DEPENDENCY]
 
 # Check if correct number of arguments is provided
-if [ $# -ne 7 ]; then
-    echo "Usage: $0 JOB_NAME MODEL TASK CONFIG_SUFFIX ACCELERATOR GPU_TYPE NUM_JOBS"
+if [ $# -lt 7 ] || [ $# -gt 8 ]; then
+    echo "Usage: $0 JOB_NAME MODEL TASK CONFIG_SUFFIX ACCELERATOR GPU_TYPE NUM_JOBS [DEPENDENCY]"
     echo "Example: $0 'my-training-seq' 'Qwen2.5-Math-7B' 'grpo' 'oatcloud' 'zero2_oatcloud' 'h100' 5"
+    echo "Example with dependency: $0 'my-training-seq' 'Qwen2.5-Math-7B' 'grpo' 'oatcloud' 'zero2_oatcloud' 'h100' 5 12345"
     exit 1
 fi
 
@@ -18,6 +19,7 @@ CONFIG_SUFFIX="$4"
 ACCELERATOR="$5"
 GPU_TYPE="$6"
 NUM_JOBS="$7"
+DEPENDENCY="${8:-}"  # Optional dependency for the first job
 
 # Validate GPU_TYPE
 if [[ "$GPU_TYPE" != "h100" && "$GPU_TYPE" != "a100" ]]; then
@@ -47,10 +49,15 @@ echo "Accelerator: $ACCELERATOR"
 echo "GPU Type: $GPU_TYPE"
 echo "Training Script: $TRAIN_SCRIPT"
 echo "Number of Jobs: $NUM_JOBS"
+if [ -n "$DEPENDENCY" ]; then
+    echo "Initial Dependency: $DEPENDENCY"
+else
+    echo "Initial Dependency: None"
+fi
 echo "================================"
 
 # Initialize variables for dependency chain
-PREVIOUS_JOB_ID=""
+PREVIOUS_JOB_ID="$DEPENDENCY"
 
 # Submit jobs in sequence with dependencies
 for ((i=1; i<=$NUM_JOBS; i++)); do
@@ -65,10 +72,14 @@ for ((i=1; i<=$NUM_JOBS; i++)); do
     # Prepare sbatch command
     SBATCH_CMD="sbatch"
     
-    # Add dependency if this is not the first job
+    # Add dependency if this is not the first job or if there's an initial dependency
     if [ -n "$PREVIOUS_JOB_ID" ]; then
         SBATCH_CMD="$SBATCH_CMD --dependency=$PREVIOUS_JOB_ID"
-        echo "  Adding dependency on job $PREVIOUS_JOB_ID"
+        if [ "$i" -eq 1 ] && [ -n "$DEPENDENCY" ]; then
+            echo "  Adding initial dependency on job $PREVIOUS_JOB_ID"
+        elif [ "$i" -gt 1 ]; then
+            echo "  Adding dependency on previous job $PREVIOUS_JOB_ID"
+        fi
     fi
     
     # Add job name

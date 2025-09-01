@@ -11,7 +11,10 @@
 source ./.env
 export CONDA_ENVS_PATH=/scratch-ssd/$USER/conda_envs
 export CONDA_PKGS_DIRS=/scratch-ssd/$USER/conda_pkgs
-export XDG_CACHE_HOME=/scratch-ssd/oatml/
+export TRANSFORMERS_CACHE=/scratch-ssd/oatml/huggingface/transformers
+export HF_HUB_CACHE=/scratch-ssd/oatml/huggingface/hub
+export HF_DATASETS_CACHE=/scratch-ssd/oatml/huggingface/datasets
+export HF_HOME=$HOME/.cache/huggingface
 export TMPDIR=/scratch/${USER}/tmp
 mkdir -p $TMPDIR
 

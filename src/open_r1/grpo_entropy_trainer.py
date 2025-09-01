@@ -23,6 +23,7 @@ from transformers.trainer_utils import EvalLoopOutput, has_length, denumpify_det
 from transformers.utils import logging
 from transformers import LogitsProcessorList, LogitsProcessor
 from accelerate.utils import broadcast_object_list, gather, gather_object
+from trl.extras.profiling import profiling_decorator
 
 from trl.data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template
 from trl.models import unwrap_model_for_generation
@@ -93,7 +94,7 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
 
 
     def _get_and_smooth_token_logps(self, model, input_ids, attention_mask, logits_to_keep, mode, return_hidden_states=False, return_entropy=False):
-        per_token_logps, entropy, embeddings, probs, action_one_hot = self._get_per_token_logps(model, input_ids, attention_mask, logits_to_keep, return_hidden_states=return_hidden_states, return_entropy=return_entropy)
+        per_token_logps, entropy, embeddings, probs, action_one_hot, top_k_token_ids = self._get_per_token_logps(model, input_ids, attention_mask, logits_to_keep, return_hidden_states=return_hidden_states, return_entropy=return_entropy)
 
         if self.smooth_logprobs:
             self._metrics[mode]["non_smoothed_logprobs/min"].append(self.accelerator.gather_for_metrics(per_token_logps.min()).mean().item())
@@ -103,7 +104,7 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
 
             self._metrics[mode]["smoothed_logprobs/min"].append(self.accelerator.gather_for_metrics(per_token_logps.min()).mean().item())
         
-        return per_token_logps, entropy, embeddings, probs, action_one_hot
+        return per_token_logps, entropy, embeddings, probs, action_one_hot, top_k_token_ids
 
     def _get_per_token_logps(self, model, input_ids, attention_mask, logits_to_keep, return_hidden_states=False, return_entropy=False):
         """Get per-token log probabilities and embeddings from the model.
@@ -132,7 +133,7 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
         log_probs = selective_log_softmax(logits, input_ids)  # compute logprobs for the input tokens
 
         # compute softmax entropy
-        entropy, probs, action_one_hot = None, None, None
+        entropy, probs, action_one_hot, top_k_indices = None, None, None, None
         if return_entropy:
             entropy, probs, top_k_indices = self._compute_entropy(logits, k = self.generation_config.top_k)
 
@@ -148,7 +149,7 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
             # hidden states are (num_layers, batch, sequence, hidden)
             embeddings = torch.stack([x for x in outputs.hidden_states])  # (num_layers, B, L, H)
         
-        return log_probs, entropy, embeddings, probs, action_one_hot
+        return log_probs, entropy, embeddings, probs, action_one_hot, top_k_indices
 
     # override the _generate_and_score_completions method to pass logprobs to the entropy reward function
     def _generate_and_score_completions(
@@ -232,6 +233,7 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
 
         return final_dict
 
+    @profiling_decorator
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         if return_outputs:
             raise ValueError("The GRPOTrainer does not support returning outputs")
@@ -246,23 +248,29 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
 
-        per_token_logps, entropy, hidden_states, probs, action_one_hot = self._get_and_smooth_token_logps(self.model, input_ids, attention_mask, logits_to_keep, mode, \
+        per_token_logps, entropy, embeddings, probs, action_one_hot, top_k_token_ids = self._get_and_smooth_token_logps(self.model, input_ids, attention_mask, logits_to_keep, mode, \
                                                                        return_entropy=True, return_hidden_states=True)
-        
-        self._compute_and_log_gradient_norm(hidden_states, per_token_logps, probs, inputs["advantages"], completion_mask, mode)
-        self._compute_and_log_gradient_direction(hidden_states, action_one_hot, probs, inputs["advantages"], completion_mask, mode)
-        hessian_coeff, full_update_term = self._compute_and_log_hessian_coefficient(hidden_states, action_one_hot, probs, inputs["advantages"], completion_mask, mode)
-        fisher_curvature, approx_kl = self._compute_and_log_fisher_curvature(hidden_states, action_one_hot, probs, inputs["advantages"], completion_mask, mode)
-        self._compute_and_log_softmax_probs_stats(probs, completion_mask, mode)
+        seq_len = top_k_token_ids.size(1)
+        hidden_states = embeddings[-1, :, -seq_len:, :]
 
+        self._compute_and_log_softmax_probs_stats(probs, completion_mask, mode)
+        self._log_feature_stats(per_token_logps, hidden_states, probs, completion_mask, mode)
+        del embeddings
+        torch.cuda.empty_cache()
+
+        ##### Compute and log gradients and curvatures #####
+        full_update_term, approx_kl = self._compute_and_log_gradients_linear_model(hidden_states, per_token_logps, probs, action_one_hot, inputs, completion_mask, top_k_token_ids, mode)
+
+        ###### Re-evaluate gradients and curvatures after curvature masking ######
         if self.curvature_masking:
             curvature_mask_hessian, _ = self._compute_hessian_curvature_mask(full_update_term, completion_mask)
             curvature_mask_fisher, _ = self._compute_fisher_curvature_mask(approx_kl, completion_mask)
             updated_mask = completion_mask * curvature_mask_hessian * curvature_mask_fisher
 
-            self._compute_and_log_hessian_coefficient(hidden_states, action_one_hot, probs, inputs["advantages"], updated_mask, mode, prefix="masked")
-            self._compute_and_log_fisher_curvature(hidden_states, action_one_hot, probs, inputs["advantages"], updated_mask, mode, prefix="masked")
-
+            # Evaluate the gradients and curvatures after the curvature masking
+            self._compute_and_log_gradients_linear_model(hidden_states, per_token_logps, probs, action_one_hot, inputs, updated_mask, top_k_token_ids, mode, prefix="masked")
+        
+        torch.cuda.empty_cache()
         gathered_entropy = self._gather_masked_tensor_across_processes(entropy, completion_mask)
         self._accumulate_stats(
             data=gathered_entropy,
@@ -335,6 +343,516 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
         self._metrics[mode]["clip_ratio"].append(self.accelerator.gather_for_metrics(clip_ratio).mean().item())
         return loss
     
+
+    @profiling_decorator
+    def _compute_and_log_gradients_linear_model(self, hidden_states, per_token_logps, probs, action_one_hot, inputs, completion_mask, top_k_token_ids, mode, prefix=""):
+        
+        ######################## Compute gradients under the linear logit model ########################
+        full_update_term = {}
+        approx_kl = {}
+
+        ###### Token Level Gradients and Curvatures ######
+        per_token_gradient = self._compute_token_level_gradients(hidden_states, probs, action_one_hot, inputs["advantages"], completion_mask, top_k_token_ids)
+        _, full_update_term['token'] = self._compute_and_log_hessian_coefficient(hidden_states, action_one_hot, probs, inputs["advantages"], completion_mask, \
+                                                        per_token_gradient, None, "token", mode, prefix)
+        _, approx_kl['token'] = self._compute_and_log_fisher_curvature(hidden_states, action_one_hot, probs, inputs["advantages"], completion_mask, \
+                                                        per_token_gradient, None, "token", mode=mode, prefix=prefix)
+        
+        ###### Per Sentence Gradients and Curvatures ######
+        dicts_per_sentence = self._sparsify_sentence_gradients(per_token_gradient, hidden_states.shape[-1], top_k_token_ids, completion_mask, hidden_states.dtype)
+        global_dicts = self._sparsify_global_gradients(per_token_gradient, hidden_states.shape[-1], top_k_token_ids, completion_mask, hidden_states.dtype)
+        proj_per_sentence_gradient = self._compute_sentence_gradients(dicts_per_sentence, hidden_states.shape[-1], top_k_token_ids, hidden_states.dtype)
+        _, full_update_term['sentence'] = self._compute_and_log_hessian_coefficient(hidden_states, action_one_hot, probs, inputs["advantages"], completion_mask, \
+                                                        proj_per_sentence_gradient, dicts_per_sentence, "sentence", mode, prefix)
+        _, approx_kl['sentence'] = self._compute_and_log_fisher_curvature(hidden_states, action_one_hot, probs, inputs["advantages"], completion_mask, \
+                                                        proj_per_sentence_gradient, dicts_per_sentence, "sentence", mode, prefix)
+        
+        # Log gradient stats, per token and per sentence
+        self._log_gradients_stats(per_token_gradient, dicts_per_sentence, completion_mask, mode, prefix)
+        del per_token_gradient, proj_per_sentence_gradient, dicts_per_sentence
+
+        ###### Global Gradients and Curvatures ######
+        proj_global_gradient, final_global_dict = self._compute_global_gradients(global_dicts, hidden_states.shape[-1], top_k_token_ids, hidden_states.dtype)
+        _, full_update_term['global'] = self._compute_and_log_hessian_coefficient(hidden_states, action_one_hot, probs, inputs["advantages"], completion_mask, \
+                                                        proj_global_gradient, final_global_dict, "global", mode, prefix)
+        _, approx_kl['global'] = self._compute_and_log_fisher_curvature(hidden_states, action_one_hot, probs, inputs["advantages"], completion_mask, \
+                                                        proj_global_gradient, final_global_dict, "global", mode, prefix)
+        del proj_global_gradient, final_global_dict, global_dicts
+
+        torch.cuda.empty_cache()
+
+        return full_update_term, approx_kl
+
+    @profiling_decorator
+    def _compute_token_level_gradients(self, h, softmax_probs, one_hot_actions, advantages, completion_mask, token_ids):
+        """
+        This function computes the gradients per token.
+        The idea of this function is: per token, we can simply implement the gradient as g = A * (v ⊗ h).
+        """
+
+        # === 1. Extract final layer hidden states and policy info ===
+        pi = softmax_probs                                 # [B, T, V]
+        e_a = one_hot_actions.to(h.dtype)                  # [B, T, V]
+        v = e_a - pi                                       # [B, T, V]
+        A = advantages.unsqueeze(1).to(h.dtype)            # [B, 1]
+
+        # === 2. Compute token-level gradients: g = A * (v ⊗ h) ===
+        g = A.unsqueeze(-1).unsqueeze(-1) * v.unsqueeze(-1) * h.unsqueeze(2)  # [B, T, V, H]
+
+        return g
+    
+    @profiling_decorator
+    def _sparsify_sentence_gradients(self, g, hidden_dim, token_ids, mask, grad_dtype):
+        """
+        This function sparsifies the gradients based on the token_ids and mask.
+        It the dictionary of gradients per token at a sentence and global level.
+
+        We need to average the gradients across the tokens, and each token spans a different subspace of tokens based on the top-k generation.
+        We cannot create a large gradient tensor for the full vocab (~150k tokens), so we build dictionaries to exploit sparsity.
+        """
+        ######################################################################################
+        # === 1. Compute gradients for each sentence ===
+        
+        # Explanation: Each per token gradient spans a subspace for their top-K tokens (K = 50). This subspace differ across tokens.
+        # Thus, we need to map the same logits (tokens) to the same gradients. 
+        # Since spanning a full vocab tensor is infeasible, we build a dictionary to exploit sparsity.
+
+        # === Dimensions ===
+        # B: batch_size, T: seq_len, V: top-K tokens, H: hidden_dim
+        batch_size, seq_len, topk_size = token_ids.shape
+
+        dicts_per_sentence = []  # List of dicts: one per sentence
+
+        # For each sentence, build dict and compute mean gradients
+        for b in range(batch_size):
+            # Mask for valid tokens in this sentence
+            sentence_mask = mask[b].unsqueeze(1).expand(seq_len, topk_size).reshape(-1)  # [T*V]
+
+            # Flatten sentence views
+            ids_flat = token_ids[b].reshape(-1)          # [T*V]
+            g_flat   = g[b].reshape(-1, hidden_dim)      # [T*V, H]
+
+            # Filter out masked positions
+            token_ids_valid = ids_flat[sentence_mask > 0]  # [N_valid]
+            g_valid = g_flat[sentence_mask > 0]                  # [N_valid, H]
+
+            # Build dictionary for this sentence
+
+            # Group by token id: unique ids, inverse mapping of each row -> group, and counts
+            uniq_ids, inverse, counts = torch.unique(token_ids_valid, return_inverse=True, return_counts=True)
+
+            # Sum gradients per group with index_add_
+            sums = torch.zeros((uniq_ids.numel(), hidden_dim), dtype=g_valid.dtype, device=self.accelerator.device)
+            sums.index_add_(0, inverse, g_valid)  # sums[g] += g_valid[i] where g = inverse[i]
+
+            means = sums / counts.unsqueeze(1)
+            # Convert to a small dict (sparse) for this sentence
+            dict_b = {int(k.item()): means[i] for i, k in enumerate(uniq_ids)}
+            dicts_per_sentence.append(dict_b)
+
+        return dicts_per_sentence
+    
+    @profiling_decorator
+    def _sparsify_global_gradients(self, g, hidden_dim, token_ids, mask, grad_dtype):
+        """
+        This function sparsifies the gradients based on the token_ids and mask.
+        It the dictionary of gradients per token at a sentence and global level.
+        """
+        # === Dimensions ===
+        # B: batch_size, T: seq_len, V: top-K tokens, H: hidden_dim
+        batch_size, seq_len, topk_size = token_ids.shape
+
+        # === Build global dictionary ===
+
+        # Group by token id: unique ids, inverse mapping of each row -> group, and counts# Build a single flat validity mask for all B*T*V
+        valid_all = mask.unsqueeze(2).expand(batch_size, seq_len, topk_size).reshape(-1)  # [B*T*V]
+
+        ids_all = token_ids.reshape(-1)                 # [B*T*V]
+        g_all   = g.reshape(-1, hidden_dim)             # [B*T*V, H]
+
+        ids_valid_all = ids_all[valid_all > 0]          # [N_all]
+        g_valid_all   = g_all[valid_all > 0]            # [N_all, H]
+
+        uniq_ids_g, inverse_g, counts_g = torch.unique(
+            ids_valid_all, return_inverse=True, return_counts=True
+        )
+        sums_g = torch.zeros((uniq_ids_g.numel(), hidden_dim), dtype=g_valid_all.dtype, device=self.accelerator.device)
+        sums_g.index_add_(0, inverse_g, g_valid_all)
+
+        # You can also return sums+counts if you prefer to delay the division.
+        # Here I return means for parity with per-sentence dicts.
+        global_dict = {int(k.item()): (sums_g[i], int(counts_g[i].item()))
+                       for i, k in enumerate(uniq_ids_g)}
+        return global_dict
+        
+    
+    @profiling_decorator
+    def _compute_sentence_gradients(self, dicts_per_sentence, hidden_dim, token_ids, grad_dtype):
+        """
+        This function computes the gradients per sentence.
+        While computing the curvatures later on, to once again exploit sparsity, we need to map the gradients back to their corresponding subspaces.
+        """
+        # === Dimensions ===
+        # B: batch_size, T: seq_len, V: top-K tokens, H: hidden_dim
+        batch_size, seq_len, topk_size = token_ids.shape
+
+        # We now the mean gradient per logit for each sentence.
+        # Now we wanna map this gradients back to their corresponding subspaces
+        # We start from token_ids and map each token_id to its corresponding gradient
+        # We do this for each token in the batch, returning a grad tensor of shape (B, T, V, H)
+        
+        # Preallocate output buffer [B, T*V, H] filled with zeros
+        grad_tensor_sentence_flat = torch.zeros((batch_size, seq_len * topk_size, hidden_dim), dtype=grad_dtype, device=self.accelerator.device)
+
+        # Flatten token_ids for easier processing
+        # Shape: [B, T*V], where each row corresponds to all tokens in a sentence
+        token_ids_flat = token_ids.view(batch_size, seq_len * topk_size)  # [B, T*V]
+
+        for b in range(batch_size):
+            dict_b = dicts_per_sentence[b] # dictionary {token_id: mean_gradient}
+            if not dict_b:
+                continue  # skip if no valid tokens
+
+            # Convert dict keys (token IDs) to a tensor [U]
+            # and stack values (mean gradients) into a tensor [U, H]
+            unique_token_ids_b = torch.tensor(list(dict_b.keys()), device=self.accelerator.device, dtype=torch.long)  # [num_unique_tokens]
+            mean_grads_b = torch.stack(list(dict_b.values()))  # [num_unique_tokens, H]
+
+            # Sort token IDs so we can perform fast search with bucketize
+            # sorted_ids[i] matches row i in sorted_grads
+            sorted_ids, perm = torch.sort(unique_token_ids_b)   # [U]
+            sorted_grads = mean_grads_b.index_select(0, perm)   # [U, H]
+
+            # All token IDs in this sentence [T*V]
+            token_ids_b_flat = token_ids_flat[b]  # [T*V]
+
+            # === Core operation: map token_ids_b_flat -> gradients ===
+            # For each token, bucketize finds the insertion index into sorted_ids
+            # "right=True" ensures exact matches map to their true index + 1
+            ins_idx = torch.bucketize(token_ids_b_flat, sorted_ids, right=True)  # [T*V], values in [0..U]
+
+            # Example:
+            #   sorted_ids = [7, 10, 42]
+            #   token_ids_b_flat = [10, 10, 1, 7, 42]
+            #   ins_idx = [2, 2, 0, 1, 3]
+            
+            # Mark tokens that are >= sorted_ids[0], i.e. not before the first ID
+            valid_rows = ins_idx > 0
+
+            if valid_rows.any():
+                # Candidate index is one step back (since ins_idx is insertion point)
+                candidate_idx = ins_idx.clamp(min=1) - 1
+
+                # Continuing example:
+                #   candidate_idx = [1, 1, -1, 0, 2]
+                
+                # Double-check matches: keep only tokens that actually equal sorted_ids[candidate_idx]
+                same = sorted_ids.index_select(0, candidate_idx[valid_rows]) == token_ids_b_flat[valid_rows]
+
+                # Example:
+                #   sorted_ids[candidate_idx] = [10, 10, 7, 42]
+                #   token_ids_b_flat[valid_rows] = [10, 10, 7, 42]
+                #   same = [True, True, True, True]
+
+                # Build final mask of valid positions where token exists in dict_b
+                final_valid = torch.zeros_like(valid_rows)
+                final_valid[valid_rows] = same
+
+                # Gather gradient rows from sorted_grads for all valid tokens
+                mapped_indices = candidate_idx[final_valid]  # [M]
+                # Example: mapped_indices = [1, 1, 0, 2]
+
+
+                gathered_grads = sorted_grads.index_select(0, mapped_indices)  # [M, H]
+                # Example: sorted_grads = [g7, g10, g42]
+                #          gathered_grads = [g10, g10, g7, g42]
+
+                # Assign gathered grads into the output buffer only at valid positions
+                grad_tensor_sentence_flat[b, final_valid] = gathered_grads
+
+                del final_valid, same, mapped_indices, gathered_grads, candidate_idx
+            
+            del unique_token_ids_b, mean_grads_b, sorted_ids, perm, sorted_grads, token_ids_b_flat, ins_idx, valid_rows
+
+        sentence_gradient = grad_tensor_sentence_flat.view(batch_size, seq_len, topk_size, hidden_dim)  # [B, T, V, H]
+        del grad_tensor_sentence_flat
+         
+        return sentence_gradient
+    
+    @profiling_decorator
+    def _compute_global_gradients(self, global_dict, hidden_dim, token_ids, grad_dtype):
+        """
+        This function computes the gradients per global level.
+        While computing the curvatures later on, to once again exploit sparsity, we need to map the gradients back to their corresponding subspaces.
+        """
+        gather_fn = self.accelerator.gather
+        # === Dimensions ===
+        # B: batch_size, T: seq_len, V: top-K tokens, H: hidden_dim
+        batch_size, seq_len, topk_size = token_ids.shape
+        num_keys = self.accelerator.gather(torch.tensor(len(global_dict.keys()), device=self.accelerator.device))
+        max_keys = max(num_keys)
+
+        if max_keys == 0:
+            final_global_dict = {}
+            global_gradient = torch.zeros((batch_size, seq_len, topk_size, hidden_dim), dtype=grad_dtype, device=self.accelerator.device)
+            return global_gradient, final_global_dict
+
+        global_dict_tensor, key_count_tensor = self._list_of_dicts_to_tensor([global_dict], max_num_tokens=max_keys, hidden_dim=hidden_dim, grad_dtype=grad_dtype)
+        gathered_global_dict_tensor = gather_fn(global_dict_tensor)
+        gathered_key_count_tensor = gather_fn(key_count_tensor)
+
+        # Aggregate the global dictionary, returning the average gradient per token_id
+        final_global_dict = self.aggregate_global_dict(gathered_global_dict_tensor, gathered_key_count_tensor, num_keys)
+
+        if not final_global_dict:
+            global_gradient = torch.zeros((batch_size, seq_len, topk_size, hidden_dim), dtype=grad_dtype, device=self.accelerator.device)
+            return global_gradient, final_global_dict
+
+        ############ We now map the global gradient back to the dense representation
+        # 0) Flatten token_ids for indexing
+        token_ids_flat_global = token_ids.flatten()  # [B*T*V]
+
+        # 1) Build tensors of keys and grads
+        keys = torch.tensor(list(final_global_dict.keys()), device=self.accelerator.device, dtype=torch.long)   # [U]
+        grads = torch.stack(list(final_global_dict.values())).to(self.accelerator.device, dtype=grad_dtype)     # [U, H]
+
+        # 2) Sort keys once, and align grads to that order
+        keys_sorted, order = torch.sort(keys)                       # [U]
+        grads_sorted = grads.index_select(0, order)                 # [U, H]
+
+        # 3) Map each token id to its index in keys_sorted via searchsorted (O(N log U))
+        idx = torch.searchsorted(keys_sorted, token_ids_flat_global)  # [N]
+        # (If some token_ids might be missing, guard it)
+        valid = (idx < keys_sorted.numel()) & (keys_sorted[idx] == token_ids_flat_global)
+        # 4) Gather in one shot
+        grad_tensor_global_flat = torch.zeros(
+            (token_ids_flat_global.numel(), grads_sorted.size(1)),
+            dtype=grad_dtype, device=self.accelerator.device
+        )
+        grad_tensor_global_flat[valid] = grads_sorted.index_select(0, idx[valid])
+
+        global_gradient = grad_tensor_global_flat.view(batch_size, seq_len, topk_size, -1)
+        
+        del grad_tensor_global_flat, token_ids_flat_global, keys, grads, keys_sorted, order, idx, valid
+        del gathered_global_dict_tensor, gathered_key_count_tensor, global_dict_tensor, key_count_tensor
+        return global_gradient, final_global_dict
+    
+    # gathered_global_dict_tensor: iterable of 2D tensors shaped [N_i, D]
+    # num_keys: iterable of ints (valid rows in each corresponding tensor)
+    # Layout per row: [key, value_0, ..., value_{V-1}, count]
+    # Types: key should be integer-like; count/value are tensors (float/long as you need).
+
+    def aggregate_global_dict(self, gathered_global_dict_tensor, gathered_key_count_tensor, num_keys):
+        # 1) Concatenate only the valid slices once
+        values = torch.cat([t[:n] for t, n in zip(gathered_global_dict_tensor, num_keys)], dim=0)
+        valid_key_count_tensors = torch.cat([t[:n] for t, n in zip(gathered_key_count_tensor, num_keys)], dim=0)
+        
+        # 2) Extract keys and counts based on tensor structure
+        has_counts = valid_key_count_tensors.shape[-1] > 1
+        
+        # Always extract keys (first column)
+        keys = valid_key_count_tensors[:, 0]
+        
+        # Extract counts only when available
+        cnts = valid_key_count_tensors[:, 1] if has_counts else None
+
+        # 3) Group by key and sum using vectorized index_add
+        uniq_keys, inv = torch.unique(keys, sorted=False, return_inverse=True)
+
+        # Initialize accumulators
+        K = uniq_keys.shape[0]
+        V = values.shape[1]
+        values_sum = torch.zeros(K, V, device=values.device, dtype=values.dtype)
+        
+        # Accumulate values
+        values_sum.index_add_(0, inv, values)
+        
+        # 4) Handle counts if available
+        if has_counts:
+            cnts_sum = torch.zeros(K, device=cnts.device, dtype=cnts.dtype)
+            cnts_sum.index_add_(0, inv, cnts)
+            
+            # Build dict by averaging the gradients
+            final_global_dict = {
+                int(k.item()): values_sum[i] /  cnts_sum[i]
+                for i, k in enumerate(uniq_keys) if cnts_sum[i] > 0
+            }
+        else:
+            # Build dict without counts
+            final_global_dict = {
+                int(k.item()): values_sum[i]
+                for i, k in enumerate(uniq_keys)
+            }
+                
+        return final_global_dict
+
+
+    @profiling_decorator
+    def _compute_gradients(self, h, per_token_logps, softmax_probs, one_hot_actions, advantages, completion_mask, token_ids):
+        """
+        This function computes the gradients per token, per sentence, and per global token.
+        It also returns the dictionary of gradients per token at a sentence and global level.
+
+        The idea of this function is: per token, we can simply implement the gradient as g = A * (v ⊗ h).
+        However, for sentence/global level we need to average the gradients across the tokens, and each token spans a different subspace of tokens based on the top-k generation.
+        We cannot create a large gradient tensor for the full vocab (~150k tokens), so we build dictionaries to exploit sparsity.
+
+        Furthermore, while computing the curvatures later on, to once again exploit sparsity, we need to map the gradients back to their corresponding subspaces.
+        """
+        gather_fn = self.accelerator.gather
+        # === Dimensions ===
+        # B: batch_size, T: seq_len, V: top-K tokens, H: hidden_dim
+        batch_size, seq_len, topk_size = token_ids.shape
+        hidden_dim = h.shape[-1] # Hidden State is of shape [B, T, H]
+
+        # === 1. Extract final layer hidden states and policy info ===
+        pi = softmax_probs                                 # [B, T, V]
+        e_a = one_hot_actions.to(h.dtype)                  # [B, T, V]
+        v = e_a - pi                                       # [B, T, V]
+        A = advantages.unsqueeze(1).to(h.dtype)            # [B, 1]
+        mask = completion_mask.to(h.dtype)                 # [B, T]
+
+        # === 2. Compute token-level gradients: g = A * (v ⊗ h) ===
+        g = A.unsqueeze(-1).unsqueeze(-1) * v.unsqueeze(-1) * h.unsqueeze(2)  # [B, T, V, H]
+
+        ######################################################################################
+        # === 3. Compute gradients for each sentence ===
+        
+        # Explanation: Each per token gradient spans a subspace for their top-K tokens (K = 50). This subspace differ across tokens.
+        # Thus, we need to map the same logits (tokens) to the same gradients. 
+        # Since spanning a full vocab tensor is infeasible, we build a dictionary to exploit sparsity.
+
+        dicts_per_sentence = []  # List of dicts: one per sentence
+        global_dict = {}
+
+        # For each sentence, build dict and compute mean gradients
+        for b in range(batch_size):
+            # Mask for valid tokens in this sentence
+            sentence_mask = mask[b, :]  # [T]
+
+            # Slice tensors for sentence
+            token_ids_b = token_ids[b]      # [T, V]
+            g_b = g[b]                      # [T, V, H]
+
+            token_ids_flat = token_ids_b.view(-1)  # [T*V]
+            g_flat = g_b.view(-1, hidden_dim)      # [T*V, H]
+
+            # Filter out masked positions
+            mask_b_expanded = sentence_mask.view(-1, 1).expand(-1, topk_size).reshape(-1)  # [T*V]
+            valid_mask = mask_b_expanded > 0
+
+            token_ids_valid = token_ids_flat[valid_mask]  # [N_valid]
+            g_valid = g_flat[valid_mask]                  # [N_valid, H]
+
+            # === Build dictionary for this sentence
+            dict_b = {}
+            unique_token_ids = token_ids_valid.unique()
+
+            for token_id in unique_token_ids:
+                token_mask = token_ids_valid == token_id
+                grads_for_token = g_valid[token_mask]  # [N_occurrences, H]
+                sum_grad = grads_for_token.sum(dim=0)  # [H]
+                cnt = grads_for_token.size(0)
+                dict_b[token_id.item()] = sum_grad / cnt
+
+                # Add grads_for_token to global dictionary. If the token_id is already in the global dictionary, we stack the gradients
+                if token_id.item() in global_dict:
+                    prev_sum_grad, prev_cnt = global_dict[token_id.item()]
+                    global_dict[token_id.item()] = (prev_sum_grad + sum_grad, prev_cnt + cnt)
+                else:
+                    global_dict[token_id.item()] = (sum_grad, cnt)
+
+            dicts_per_sentence.append(dict_b)
+
+        # We now know the mean gradient per logit for each sentence.
+        # Now we wanna map this gradients back to their corresponding subspaces
+        # We start from token_ids and map each token_id to its corresponding gradient
+        # We do this for each token in the batch, returning a grad tensor of shape (B, T, V, H)
+        grad_tensor_sentence_flat = torch.zeros((batch_size, seq_len * topk_size, hidden_dim), dtype=h.dtype, device=h.device)
+
+        # Flatten token_ids for indexing
+        token_ids_flat = token_ids.view(batch_size, -1)  # [B, T*V]
+
+        for b in range(batch_size):
+            dict_b = dicts_per_sentence[b]
+            if not dict_b:
+                continue  # skip if no valid tokens
+
+            # Stack token IDs and mean gradients for this batch
+            unique_token_ids_b = torch.tensor(list(dict_b.keys()), device=h.device, dtype=torch.long)  # [num_unique_tokens]
+            mean_grads_b = torch.stack(list(dict_b.values()))  # [num_unique_tokens, H]
+
+            # Create a mapping from token_id -> position in unique_token_ids_b
+            token_id_to_idx = {tid.item(): idx for idx, tid in enumerate(unique_token_ids_b)}
+
+            # Map token_ids_flat[b] -> mean_grad
+            token_ids_b_flat = token_ids_flat[b]  # [T*V]
+            # Create a mask for which tokens have a mean gradient
+            mapped_indices = torch.tensor(
+                [token_id_to_idx.get(tid.item(), -1) for tid in token_ids_b_flat],
+                device=h.device
+            )  # [T*V], -1 means no gradient
+
+            # Prepare assignment buffer
+            assigned_grads = torch.zeros((token_ids_b_flat.size(0), hidden_dim),
+                                        dtype=mean_grads_b.dtype,
+                                        device=mean_grads_b.device)
+
+            valid_rows = mapped_indices >= 0
+            if valid_rows.any():
+                assigned_grads[valid_rows] = mean_grads_b[mapped_indices[valid_rows]]
+
+            grad_tensor_sentence_flat[b] = assigned_grads
+
+        sentence_gradient = grad_tensor_sentence_flat.view(batch_size, seq_len, topk_size, hidden_dim)  # [B, T, V, H]
+        ######################################################################################
+
+        # === 4. Compute global gradient ===
+        gathered_global_dict = gather_object([global_dict])
+        
+
+        # First, merge all the global dictionaries. If the token_id is already in the global dictionary, we stack the gradients
+        final_global_dict = {}
+        for gathered_dict in gathered_global_dict:
+            for token_id, (sum_grad, cnt) in gathered_dict.items():
+                # Ensure both sum_grad and count are tensors on the *local* device
+                sum_grad = sum_grad.to(h.device, non_blocking=True)
+                cnt = torch.as_tensor(cnt, device=h.device)
+                if token_id in final_global_dict:
+                    prev_sum_grad, prev_cnt = final_global_dict[token_id]
+                    final_global_dict[token_id] = (prev_sum_grad + sum_grad, prev_cnt + cnt)
+                else:
+                    final_global_dict[token_id] = (sum_grad, cnt)
+
+        # Compute the mean of the gradients in the global dictionary
+        total_tokens = 0
+        for token_id in final_global_dict:
+            sum_grad, cnt = final_global_dict[token_id]
+            total_tokens += cnt
+            final_global_dict[token_id] = sum_grad / cnt
+
+        # We use the same logic as before to map the global gradient back to the sentence_gradient tensor
+        grad_tensor_global_flat = torch.zeros((batch_size * seq_len * topk_size, hidden_dim), dtype=h.dtype, device=h.device)
+
+        # Flatten token_ids for indexing
+        token_ids_flat_global = token_ids.flatten()  # [B*T*V]
+
+        unique_token_ids_global = torch.tensor(list(final_global_dict.keys()), device=h.device, dtype=torch.long)  # [num_unique_tokens]
+        mean_grads_global = torch.stack(list(final_global_dict.values()))  # [num_unique_tokens, H]
+
+        for j, tid in enumerate(unique_token_ids_global):
+            rows = torch.nonzero(token_ids_flat_global == tid, as_tuple=False).squeeze(-1)
+            if rows.numel() > 0:
+                grad_tensor_global_flat.index_copy_(0, rows, mean_grads_global[j].expand(rows.size(0), -1))
+
+        global_gradient = grad_tensor_global_flat.view(batch_size, seq_len, topk_size, hidden_dim)  # [B, T, V, H]
+        ######################################################################################
+        
+        del grad_tensor_sentence_flat, grad_tensor_global_flat, token_ids_flat, token_ids_flat_global, unique_token_ids_global, mean_grads_global
+        return g, sentence_gradient, global_gradient, dicts_per_sentence, final_global_dict
+            
+
+
     def _compute_hessian_curvature_mask(self, full_update_term, completion_mask):
         curvature_mask = torch.ones_like(completion_mask)
 
@@ -385,6 +903,7 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
         masks["total"] = curvature_mask
         return curvature_mask, masks
 
+    @profiling_decorator
     def _compute_and_log_softmax_probs_stats(self, softmax_probs, completion_mask, mode):
         # Compute sharpness
         with torch.inference_mode():
@@ -449,7 +968,9 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
         sharpness = torch.where(valid, sharpness, torch.full_like(sharpness, default_sharpness))
         return sharpness
 
-    def _compute_and_log_gradient_direction(self, hidden_states, one_hot_actions, softmax_probs, advantages, completion_mask, mode):
+
+    # TODO: Remove or fix this function - currently implementing the wrong thing
+    def _compute_and_log_gradient_direction(self, features, one_hot_actions, softmax_probs, advantages, completion_mask, mode):
         """
         Returns:
             grad_directions: Tensor of shape (B, T, D) - normalized gradient direction vectors
@@ -463,9 +984,6 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
 
             # Multiply by advantages: shape (B, T, K)
             weighted_delta = advantages.unsqueeze(-1).unsqueeze(-1) * delta  # (B, T, K)
-
-            # Features
-            features = hidden_states[-1, :, -T:, :]
 
             # Compute gradient: weighted sum of features per token
             # (B, T, K) @ (B, T, D) → (B, T, D)
@@ -551,18 +1069,31 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
                 mode=mode,
                 stats={'metric': lambda x: x.mean().item() }
             )
-
-    def _compute_and_log_gradient_norm(self, hidden_states, logprobs, softmax_probs, advantages, completion_mask, mode):
+            
+    @profiling_decorator
+    def _log_feature_stats(self, logprobs, features, softmax_probs, completion_mask, mode):
         # Compute feature norm
         with torch.inference_mode():
             seq_len = logprobs.shape[1]
-            feature_norm = torch.norm(hidden_states[-1, :, -seq_len:, :], dim=-1)
+            feature_norm = torch.norm(features, dim=-1)
             gathered_feature_norm = self._gather_masked_tensor_across_processes(feature_norm, completion_mask)
             self._accumulate_stats(
                 data=gathered_feature_norm,
                 metric_name='per_token_feature_norm',
                 mode=mode,
                 stats=DEFAULT_STATS,
+            )
+
+            # ---- Variance of hidden states across samples ----
+            gathered_features = self._gather_masked_tensor3d_across_processes(features, completion_mask)
+            h_mean = gathered_features.mean(dim=0)
+            h_var = torch.norm(gathered_features - h_mean, dim=-1) ** 2  # (B, T)
+            self._accumulate_stats(
+                data=h_var,
+                metric_name='feature_vector_variance',
+                mode=mode,
+                stats={ 'metric': lambda x: x.mean().item(),
+                    'max_squared_error': lambda x: x.max().item() },
             )
 
             policy_norm_sq = (softmax_probs**2).sum(dim=-1)
@@ -576,51 +1107,17 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
                 mode=mode
             )
 
-            grad_norm = torch.abs(advantages.unsqueeze(1)) * torch.sqrt(policy_error_norm) * feature_norm
-
-
-            mean_grad_norm = (grad_norm * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)
-            gathered_mean_grad_norm = self.accelerator.gather(mean_grad_norm)
+    @profiling_decorator
+    def _log_gradients_stats(self, per_token_gradient, dicts_per_sentence, completion_mask, mode, prefix=""):
+        batch_size, seq_len, topk_size, hidden_dim = per_token_gradient.shape
+        with torch.inference_mode():
+            # Log per token gradient norm
+            token_grad = per_token_gradient.view(batch_size, seq_len, -1) # (B, T, V*H)
+            norm_per_token_grad = torch.norm(token_grad, dim=-1) # (B, T)
+            gathered_per_token_gradient = self._gather_masked_tensor_across_processes(norm_per_token_grad, completion_mask)
             self._accumulate_stats(
-                data=gathered_mean_grad_norm,
-                metric_name='per_sentence_gradient_norm',
-                mode=mode,
-                stats={
-                    **DEFAULT_STATS,
-                    'p85': lambda x: x.quantile(0.85).item(),
-                    'p90': lambda x: x.quantile(0.9).item(),
-                    'p95': lambda x: x.quantile(0.95).item(),
-                    'p99': lambda x: x.quantile(0.99).item(),
-                },
-            )
-
-            # Compute per sentence average gradient norm
-            # Compute averages over groups of N elements
-            N = self.num_generations
-            num_groups = len(gathered_mean_grad_norm) // N
-            grad_norm_per_state = gathered_mean_grad_norm.reshape(num_groups, N)
-            mu_s = grad_norm_per_state.mean(dim=1)
-            sq_sigma_s = grad_norm_per_state.var(dim=1)
-
-            self._accumulate_stats(
-                data=sq_sigma_s,
-                metric_name='action_level_variance',
-                mode=mode,
-                stats={ 'metric': lambda x: x.mean().item() } # action level variance is the mean of the variance
-            )
-
-            self._accumulate_stats(
-                data=mu_s,
-                metric_name='state_level_variance',
-                mode=mode,
-                stats={'metric': lambda x: x.var().item() } # state level variance is the variance of the mean
-            )
-
-
-            gathered_all_grad_norm = self._gather_masked_tensor_across_processes(grad_norm, completion_mask)
-            self._accumulate_stats(
-                data=gathered_all_grad_norm,
-                metric_name='per_token_gradient_norm',
+                data=gathered_per_token_gradient,
+                metric_name=f'{prefix}_per_token_gradient_norm' if prefix else "per_token_gradient_norm",
                 mode=mode,
                 stats={
                     **DEFAULT_STATS,
@@ -630,18 +1127,133 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
                 }
             )
 
-    def _compute_and_log_hessian_coefficient(self, hidden_states, one_hot_actions, softmax_probs, advantages, completion_mask, mode, prefix=""):
+            # Log per sentence gradient norm
+            norms = []
+            for d in dicts_per_sentence:
+                # If d is empty, append a 0 tensor
+                if not d:
+                    norms.append(torch.tensor(0.0, device=self.accelerator.device, dtype=per_token_gradient.dtype))
+                    continue
+                values = list(d.values())
+                stacked_values = torch.stack(values)  # [num_tokens, hidden_dim]
+                norm_sq = torch.norm(stacked_values, dim=-1).pow(2).sum()  # More efficient
+                norms.append(norm_sq.sqrt())
+
+            norm_tensor = torch.stack(norms)
+            gathered_norm_tensor = self.accelerator.gather(norm_tensor).float()
+            self._accumulate_stats(
+                data=gathered_norm_tensor,
+                metric_name=f'{prefix}_per_sentence_gradient_norm' if prefix else "per_sentence_gradient_norm",
+                mode=mode,
+                stats=DEFAULT_STATS,
+            )
+
+
+            # Log per sentence gradient full variance
+            # mean of squared L2 Norm: compute average of gathered_norm_tensor square
+            mean_sq_l2_norm = (gathered_norm_tensor**2).mean()
+            # We need to compute the norm of the mean gradient
+            N = len(dicts_per_sentence)
+
+            all_keys = set()
+            for d in dicts_per_sentence:
+                all_keys.update(d.keys())
+            
+            # # Pre-allocate sum_v with proper device and dtype
+            # first_value = next(iter(next(d for d in dicts_per_sentence if d).values()))
+            # sum_v = {k: torch.zeros_like(first_value) for k in all_keys}
+            
+
+            # Reducing dicts_per_sentence into a single dict
+            pairs = [(k, v) for d in dicts_per_sentence for k, v in d.items()]
+            if not pairs:
+                sum_v = {}
+            else:
+                vals = torch.stack([v for _, v in pairs], dim=0).to(self.accelerator.device)    # [M, D]
+                keys = torch.tensor([k for k, _ in pairs], device=self.accelerator.device, dtype=torch.long)
+                uniq, inv = torch.unique(keys, sorted=False, return_inverse=True)
+                add = torch.zeros(uniq.numel(), vals.size(1), device=self.accelerator.device, dtype=vals.dtype)
+                add.index_add_(0, inv, vals)
+                sum_v = {k.item(): add[i] for i, k in enumerate(uniq)}
+
+            dict_keys = self.accelerator.gather(torch.tensor(len(sum_v.keys()), device=self.accelerator.device))
+            max_keys = max(dict_keys)
+
+            if max_keys == 0:
+                all_sum_v = {}
+            else:
+                # Convert to tensor
+                sum_v_tensor, sum_v_key_count_tensor = self._list_of_dicts_to_tensor([sum_v], max_num_tokens=max_keys, hidden_dim=hidden_dim, grad_dtype=per_token_gradient.dtype)
+                
+                gathered_sum_v = self.accelerator.gather(sum_v_tensor)
+                gathered_sum_v_key = self.accelerator.gather(sum_v_key_count_tensor)
+                all_N = sum(self.accelerator.gather(torch.tensor(N, device=self.accelerator.device)))
+
+                all_sum_v = self.aggregate_global_dict(gathered_sum_v, gathered_sum_v_key, dict_keys)
+
+            if not all_sum_v:
+                norm_sq_mean_v = 0.0
+            else:
+                mean_v_tensor = torch.stack(list(all_sum_v.values())) / all_N
+                norm_sq_mean_v = torch.sum(mean_v_tensor ** 2)
+
+            sentence_gradient_variance = (mean_sq_l2_norm - norm_sq_mean_v).unsqueeze(0)
+
+            self._accumulate_stats(
+                data=sentence_gradient_variance.float(),
+                metric_name=f'{prefix}_sentence_full_gradient_variance' if prefix else "sentence_full_gradient_variance",
+                mode=mode,
+                stats={ 'metric': lambda x: x.mean().item(),
+                    'max_squared_error': lambda x: x.max().item(),
+                    'p75': lambda x: x.quantile(0.75).item(),
+                    'p90': lambda x: x.quantile(0.9).item(),
+                    'p95': lambda x: x.quantile(0.95).item(),
+                    'p99': lambda x: x.quantile(0.99).item(), },
+            )
+
+    @profiling_decorator
+    def _compute_and_log_hessian_coefficient(self, h, one_hot_actions, softmax_probs, advantages, completion_mask, 
+                                             g, sparse_g_dict, granularity, mode, prefix=""):
         """
         Compute the hessian coefficient for each token in the sequence.
         """
-        def compute_hessian_token_level(A, v, h, pi, g_flat, mask):
-            # Computes: ρ = A (‖v‖² - vᵀ F v / ‖v‖²) ‖h‖²
-            v_norm_sq = (v ** 2).sum(-1)                      # [B, T]
-            h_norm_sq = (h ** 2).sum(-1)                      # [B, T]
-            fisher_proj = (pi * (v ** 2)).sum(-1)             # [B, T]
-            norm_fisher = fisher_proj / (v_norm_sq + 1e-8)     # [B, T]
-            hessian_token = A * (v_norm_sq - norm_fisher) * h_norm_sq
-            return hessian_token
+        def compute_hessian_token_level(G, A, v, h, pi, mask, gather_fn):
+            # Step 1: Compute u = G @ h
+            # G: (B, T, V, H), h: (B, T, H) => u: (B, T, V)
+            u = torch.einsum('btvh,bth->btv', G, h)  # u = G h
+
+            # Step 2: Compute per-sample contributions
+            per_token_hessian = compute_per_sample_hessian_contributions(u, A, v, pi)
+
+            # Step 3: Masked sentence-level average
+            return per_token_hessian
+        
+        def compute_hessian_sentence_level(g_sent, A, v, h, pi, mask, gather_fn):
+            # Compute per-sample Hessian contributions
+            contrib = compute_hessian_token_level(g_sent, A, v, h, pi, mask, gather_fn)
+
+            # Masked sentence-level average
+            contrib = contrib * mask         # (B, T)
+            sentence_sum = contrib.sum(dim=1)        # (B,)
+            sentence_len = mask.sum(dim=1).clamp(min=1.0)  # (B,)
+            hessian_per_sentence = sentence_sum / sentence_len  # (B,)
+            
+            return hessian_per_sentence
+        
+        def compute_hessian_global_level(g_global, A, v, h, pi, mask, gather_fn):
+            # Compute per-sample Hessian contributions
+            contrib = compute_hessian_token_level(g_global, A, v, h, pi, mask, gather_fn)
+
+            # Masked sentence-level average
+            contrib = contrib * mask         # (B, T)
+            sentence_sum = contrib.sum(dim=1)        # (B,)
+            sentence_len = mask.sum(dim=1).clamp(min=1.0)  # (B,)
+            hessian_per_sentence = sentence_sum / sentence_len  # (B,)
+
+            # Global-level average
+            hessian_global = gather_fn(hessian_per_sentence).mean() # (1,)
+            
+            return hessian_global
         
         def compute_per_sample_hessian_contributions(u, A, v, pi):
             # Step 2: First term: (vᵗ u)^2
@@ -649,9 +1261,7 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
             first_term = dot ** 2      # (B, T)
 
             # Step 3: Compute Fisher matrix F = diag(pi) - pi @ piᵗ
-            F_diag = torch.diag_embed(pi)                          # (B, T, V, V)
-            pi_outer = pi.unsqueeze(-1) @ pi.unsqueeze(-2)         # (B, T, V, V)
-            F = F_diag - pi_outer                                  # (B, T, V, V)
+            F = torch.diag_embed(pi) - pi.unsqueeze(-1) @ pi.unsqueeze(-2)    # (B, T, V, V)
 
             # Step 4: Compute uᵗ F u = Tr(F u uᵗ)
             u_unsq = u.unsqueeze(-1)                               # (B, T, V, 1)
@@ -662,200 +1272,188 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
             delta = first_term - second_term                       # (B, T)
             contrib = A * delta                        # (B, T)
             return contrib
-        
-        def compute_hessian_sentence_level(g_sent, A, v, h, pi, mask, gather_fn):
-            # Step 1: Reshape g_sent to (B, V, H)
-            B, T, V = v.shape
-            H = h.shape[-1]
-            G = g_sent.view(B, V, H)  # (B, V, H)
 
-            # Step 2: Compute u = G @ h
-            # G: (B, V, H), h: (B, T, H) => u: (B, T, V)
-            u = torch.einsum('bvh,bth->btv', G, h)  # u = G h
-
-            # Step 3: Compute per-sample contributions
-            contrib = compute_per_sample_hessian_contributions(u, A, v, pi)
-
-            # Step 4: Masked sentence-level average
-            contrib = contrib * mask         # (B, T)
-            sentence_sum = contrib.sum(dim=1)        # (B,)
-            sentence_len = mask.sum(dim=1).clamp(min=1.0)  # (B,)
-            hessian_per_sentence = sentence_sum / sentence_len  # (B,)
-            
-            return hessian_per_sentence
-        
-        def compute_hessian_global_level(g_sent, A, v, h, pi, mask, gather_fn):
-            g_global = gather_fn(g_sent).mean(0)                   # [D]
-            B, T, V = v.shape
-            H = h.shape[-1]
-
-            # Step 1: Reshape g_global to (V, H)
-            G = g_global.view(V, H)  # (V, H)
-
-            # Step 2: u = G @ h => shape (B, T, V)
-            u = torch.einsum('vh,bth->btv', G, h)
-
-            # Step 3: Compute per-sample contributions
-            contrib = compute_per_sample_hessian_contributions(u, A, v, pi)
-
-            # Step 4: Masked sentence-level average
-            contrib = contrib * mask         # (B, T)
-            sentence_sum = contrib.sum(dim=1)        # (B,)
-            sentence_len = mask.sum(dim=1).clamp(min=1.0)  # (B,)
-            hessian_per_sentence = sentence_sum / sentence_len  # (B,)
-
-            # Step 5: Global-level average
-            hessian_global = gather_fn(hessian_per_sentence).mean() # (1,)
-            
-            return hessian_global, g_global
-
-        
         def compute_hessian_inference_wrapper(compute_fn, allow_grad):
             if allow_grad:
                 return compute_fn()
             else:
                 with torch.inference_mode():
                     return compute_fn()
-
+                
         # Helper function to encapsulate the calculations and logging
-        def _compute_hessian_coefficients():
+        def _compute_hessian_coefficients(g, sparse_g_dict, hessian_lambda, hessian_fn, granularity, log_gather_fn=None):
             gather_fn = self.accelerator.gather
             # === Dimensions ===
             # B: batch_size, T: seq_len, V: vocab_size, H: hidden_dim, D: V * H
             batch_size, seq_len, vocab_size = softmax_probs.shape
-            hidden_dim = hidden_states[-1].shape[-1]
+            hidden_dim = h.shape[-1]
             D = vocab_size * hidden_dim  # flattened feature dimension
 
             # === 1. Extract final layer hidden states and policy info ===
-            h = hidden_states[-1, :, -seq_len:, :]             # [B, T, H]
             pi = softmax_probs                                 # [B, T, V]
             e_a = one_hot_actions.to(h.dtype)                  # [B, T, V]
             v = e_a - pi                                       # [B, T, V]
             A = advantages.unsqueeze(1).to(h.dtype)            # [B, 1]
             mask = completion_mask.to(h.dtype)                 # [B, T]
-            mask_f = mask.float().to(h.dtype)
-            mask_sum = mask_f.sum(dim=1).clamp(min=1).unsqueeze(-1)  # [B, 1]
+            
+            # === 2. Compute effective gradients ===
+            effective_g, effective_g_dict = self._compute_effective_gradients(g, sparse_g_dict)
+
+            # === 3. Compute hessian coefficient ===
+            hessian = compute_hessian_inference_wrapper(
+                lambda: hessian_fn(effective_g, A, v, h, pi, mask, gather_fn),
+                hessian_lambda != 0.0
+            )
+
+            # === 4. Compute full update term ===
+            lr = self.lr_scheduler.get_last_lr()[0]
+
+            grad_norm_sq = _compute_grad_norm_sq(g, effective_g, sparse_g_dict, effective_g_dict, granularity)
+
+            full_update_term = lr * grad_norm_sq + 0.5 * hessian * lr**2
+
+            # === 5. Log stats ===
+            if granularity == "global":
+                hessian = hessian.unsqueeze(0).float()
+                full_update_term = full_update_term.unsqueeze(0).float()
+            log_hessian_stats(hessian, full_update_term, mode, f"{prefix}_{granularity}" if prefix else f"{granularity}", gather_fn=log_gather_fn)
+            return hessian, full_update_term
+        
+        def _compute_grad_norm_sq(g, effective_g, sparse_g_dict, effective_g_dict, granularity):
+            if granularity == "token":
+                # Token-level grad norm: simple dot product, as the logits map directly from g_token to effective_g_token. Using bmm to avoid materializing big tensors.
+                B, T, V, H = g.shape
+                bt = B * T
+                token_grad_norm_sq = torch.bmm(
+                    g.reshape(bt, 1, V * H).contiguous(),
+                    effective_g.reshape(bt, V * H, 1).contiguous()
+                ).reshape(B, T)
+                return token_grad_norm_sq
+            
+            if granularity == "sentence":
+                return self._sparse_dot_product_sentence_level(sparse_g_dict, effective_g_dict, g.dtype)
+            elif granularity == "global":
+                return self._sparse_dot_product_global_level(sparse_g_dict, effective_g_dict, g.dtype)
+
+        # # Helper function to encapsulate the calculations and logging
+        # def _compute_hessian_coefficients():
+        #     gather_fn = self.accelerator.gather
+        #     # === Dimensions ===
+        #     # B: batch_size, T: seq_len, V: vocab_size, H: hidden_dim, D: V * H
+        #     batch_size, seq_len, vocab_size = softmax_probs.shape
+        #     hidden_dim = h.shape[-1]
+        #     D = vocab_size * hidden_dim  # flattened feature dimension
+
+        #     # === 1. Extract final layer hidden states and policy info ===
+        #     pi = softmax_probs                                 # [B, T, V]
+        #     e_a = one_hot_actions.to(h.dtype)                  # [B, T, V]
+        #     v = e_a - pi                                       # [B, T, V]
+        #     A = advantages.unsqueeze(1).to(h.dtype)            # [B, 1]
+        #     mask = completion_mask.to(h.dtype)                 # [B, T]
             
 
-            # === 2. Compute token-level gradients: φ = A * (v ⊗ h) ===
-            g = A.unsqueeze(-1).unsqueeze(-1) * v.unsqueeze(-1) * h.unsqueeze(2)  # [B, T, V, H]
-            g_flat = g.view(batch_size, seq_len, -1)                            # [B, T, D]
+        #     # === 2. Compute effective gradients ===
+        #     effective_g_token, _ = self._compute_effective_gradients(g_token)
+        #     effective_g_sent, effective_g_dicts_per_sentence = self._compute_effective_gradients(g_sent, dicts_per_sentence)
+        #     effective_g_global, effective_g_global_dict = self._compute_effective_gradients(g_global, final_global_dict)
 
-            # === 3. Compute mean gradients ===
-            # Sentence level: mean over valid tokens
-            g_sent = (g_flat * mask_f.unsqueeze(-1)).sum(1) / mask_sum         # [B, D]
+        #     # === 3. Compute hessian coefficient ===
+        #     hessian_token = compute_hessian_inference_wrapper(
+        #         lambda: compute_hessian_token_level(A, v, h, pi, effective_g_token),
+        #         self.hessian_token_lambda != 0.0
+        #     )
+        #     hessian_sentence = compute_hessian_inference_wrapper(
+        #         lambda: compute_hessian_sentence_level(effective_g_sent, A, v, h, pi, mask, gather_fn),
+        #         self.hessian_sentence_lambda != 0.0
+        #     )
+        #     hessian_global = compute_hessian_inference_wrapper(
+        #         lambda: compute_hessian_global_level(effective_g_global, A, v, h, pi, mask, gather_fn),
+        #         self.hessian_global_lambda != 0.0
+        #     )
 
-            # === 4. Compute hessian coefficient ===
-            hessian_token = compute_hessian_inference_wrapper(
-                lambda: compute_hessian_token_level(A, v, h, pi, g_flat, mask),
-                self.hessian_token_lambda != 0.0
-            )
-            hessian_sentence = compute_hessian_inference_wrapper(
-                lambda: compute_hessian_sentence_level(g_sent, A, v, h, pi, mask, gather_fn),
-                self.hessian_sentence_lambda != 0.0
-            )
-            hessian_global, g_global = compute_hessian_inference_wrapper(
-                lambda: compute_hessian_global_level(g_sent, A, v, h, pi, mask, gather_fn),
-                self.hessian_global_lambda != 0.0
-            )
+        #     # === 4. Compute full update term ===
+        #     lr = self.lr_scheduler.get_last_lr()[0]
+            
+        #     # Token-level grad norm: simple dot product, as the logits map directly from g_token to effective_g_token. Using bmm to avoid materializing big tensors.
+        #     B, T, V, H = g_token.shape
+        #     bt = B * T
+        #     token_grad_norm_sq = torch.bmm(
+        #         g_token.reshape(bt, 1, V * H).contiguous(),
+        #         effective_g_token.reshape(bt, V * H, 1).contiguous()
+        #     ).reshape(B, T)
+            
+        #     # Sentence-level grad norm: requires sparse dot product over dict of sequences
+        #     sentence_grad_norm_sq = self._sparse_dot_product_sentence_level(dicts_per_sentence, effective_g_dicts_per_sentence)
+        #     global_grad_norm_sq = self._sparse_dot_product_global_level(final_global_dict, effective_g_global_dict)
 
-            # === 5. Compute full update term ===
-            lr = self.lr_scheduler.get_last_lr()[0]
-            token_grad_norm_sq = torch.sum(g_flat ** 2, dim=-1)
-            sentence_grad_norm_sq = torch.sum(g_sent ** 2, dim=-1)
-            global_grad_norm_sq = torch.sum(g_global ** 2, dim=-1)
+        #     full_token_update_term = lr * token_grad_norm_sq + 0.5 * hessian_token * lr**2
+        #     full_sentence_update_term = lr * sentence_grad_norm_sq + 0.5 * hessian_sentence * lr**2
+        #     full_global_update_term = lr * global_grad_norm_sq + 0.5 * hessian_global * lr**2
 
+        #     # === 5. Log stats ===
+        #     log_hessian_stats(hessian_global.unsqueeze(0).float(), full_global_update_term, mode, f"{prefix}_global" if prefix else "global")
+        #     log_hessian_stats(hessian_sentence, full_sentence_update_term, mode, f"{prefix}_per_sentence" if prefix else "per_sentence", gather_fn=lambda t: self.accelerator.gather(t).float())
+        #     log_hessian_stats(hessian_token, full_token_update_term, mode, f"{prefix}_per_token" if prefix else "per_token", gather_fn=lambda t: self._gather_masked_tensor_across_processes(t, completion_mask).float())
 
-            full_token_update_term = lr * token_grad_norm_sq + token_grad_norm_sq * 0.5 * hessian_token * lr**2
-            full_sentence_update_term = lr * sentence_grad_norm_sq + sentence_grad_norm_sq * 0.5 * hessian_sentence * lr**2
-            full_global_update_term = lr * global_grad_norm_sq + global_grad_norm_sq * 0.5 * hessian_global * lr**2
-
-            # === 6. Log stats ===
-            log_hessian_stats(hessian_global.unsqueeze(0).float(), g_global.float(), mode, f"{prefix}_global" if prefix else "global")
-            log_hessian_stats(hessian_sentence, g_sent, mode, f"{prefix}_per_sentence" if prefix else "per_sentence", gather_fn=lambda t: self.accelerator.gather(t).float())
-            log_hessian_stats(hessian_token, g_flat, mode, f"{prefix}_per_token" if prefix else "per_token", gather_fn=lambda t: self._gather_masked_tensor_across_processes(t, completion_mask).float())
-
-            hessian_stats = {
-                "global": hessian_global,
-                "sentence": hessian_sentence,
-                "token": hessian_token,
-            }
-            full_update_stats = {
-                "global": full_global_update_term,
-                "sentence": full_sentence_update_term,
-                "token": full_token_update_term,
-            }
-            return hessian_stats, full_update_stats
+        #     hessian_stats = {
+        #         "global": hessian_global,
+        #         "sentence": hessian_sentence,
+        #         "token": hessian_token,
+        #     }
+        #     full_update_stats = {
+        #         "global": full_global_update_term,
+        #         "sentence": full_sentence_update_term,
+        #         "token": full_token_update_term,
+        #     }
+        #     return hessian_stats, full_update_stats
         
-        def log_hessian_stats(hessian_coeff, grad, mode, metric_prefix, gather_fn=None):
+        def log_hessian_stats(hessian_coeff, full_update_term, mode, metric_prefix, gather_fn=None):
             if gather_fn is not None:
                 gathered_hessian_coeff = gather_fn(hessian_coeff)
+                gathered_full_update_term = gather_fn(full_update_term)
             else:
                 gathered_hessian_coeff = hessian_coeff
+                gathered_full_update_term = full_update_term
             
             self._accumulate_stats(
-                data=gathered_hessian_coeff,
+                data=gathered_hessian_coeff.float(),
                 metric_name=f'{metric_prefix}_hessian_coeff',
                 mode=mode,
                 stats={
                     **DEFAULT_STATS,
-                    'p85': lambda x: x.quantile(0.85).item(),
-                    'p90': lambda x: x.quantile(0.9).item(),
-                    'p95': lambda x: x.quantile(0.95).item(),
                     'p99': lambda x: x.quantile(0.99).item(),
                 }
             )
 
             self._accumulate_stats(
-                data=torch.abs(gathered_hessian_coeff),
+                data=torch.abs(gathered_hessian_coeff).float(),
                 metric_name=f'{metric_prefix}_hessian_coeff_abs',
                 mode=mode,
                 stats={
                     **DEFAULT_STATS,
-                    'p85': lambda x: x.quantile(0.85).item(),
-                    'p90': lambda x: x.quantile(0.9).item(),
-                    'p95': lambda x: x.quantile(0.95).item(),
                     'p99': lambda x: x.quantile(0.99).item(),
                 }
             )
 
-            # log quadractic coefficient
-            lr = self.lr_scheduler.get_last_lr()[0]
-            quadratic_coeff = 0.5 * gathered_hessian_coeff * lr**2
-            self._accumulate_stats(
-                data=quadratic_coeff,
-                metric_name=f'{metric_prefix}_hessian_coeff_quadratic_coeff',
-                mode=mode,
-                stats={
-                    **DEFAULT_STATS,
-                    'p85': lambda x: x.quantile(0.85).item(),
-                    'p90': lambda x: x.quantile(0.9).item(),
-                    'p95': lambda x: x.quantile(0.95).item(),
-                    'p99': lambda x: x.quantile(0.99).item(),
-                }
-            )
-            # log quadratic term
-            grad_norm_sq = torch.sum(grad ** 2, dim=-1)
-            if gather_fn is not None:
-                grad_norm_sq = gather_fn(grad_norm_sq)
-            quadratic_term = grad_norm_sq * quadratic_coeff
-            self._accumulate_stats(
-                data=quadratic_term,
-                metric_name=f'{metric_prefix}_hessian_coeff_quadratic_term',
-                mode=mode,
-                stats={
-                    **DEFAULT_STATS,
-                    'p85': lambda x: x.quantile(0.85).item(),
-                    'p90': lambda x: x.quantile(0.9).item(),
-                    'p95': lambda x: x.quantile(0.95).item(),
-                    'p99': lambda x: x.quantile(0.99).item(),
-                }
-            )
+            # # log quadractic coefficient
+            # lr = self.lr_scheduler.get_last_lr()[0]
+            # quadratic_coeff = 0.5 * gathered_hessian_coeff * lr**2
+            # self._accumulate_stats(
+            #     data=quadratic_coeff.float(),
+            #     metric_name=f'{metric_prefix}_hessian_coeff_quadratic_coeff',
+            #     mode=mode,
+            #     stats={
+            #         **DEFAULT_STATS,
+            #         'p85': lambda x: x.quantile(0.85).item(),
+            #         'p90': lambda x: x.quantile(0.9).item(),
+            #         'p95': lambda x: x.quantile(0.95).item(),
+            #         'p99': lambda x: x.quantile(0.99).item(),
+            #     }
+            # )
 
             # log full update term
-            full_update_term = lr * grad_norm_sq + quadratic_term
             self._accumulate_stats(
-                data=full_update_term,
+                data=gathered_full_update_term.float(),
                 metric_name=f'{metric_prefix}_full_update_term',
                 mode=mode,
                 stats={
@@ -867,68 +1465,72 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
                 }
             )
 
+        def _get_hessian_lambda_and_fn(granularity):
+            if granularity == "token":
+                return self.hessian_token_lambda, compute_hessian_token_level, lambda t: self._gather_masked_tensor_across_processes(t, completion_mask)
+            elif granularity == "sentence":
+                return self.hessian_sentence_lambda, compute_hessian_sentence_level, lambda t: self.accelerator.gather(t)
+            elif granularity == "global":
+                return self.hessian_global_lambda, compute_hessian_global_level, None
+
+        hessian_lambda, hessian_fn, log_gather_fn = _get_hessian_lambda_and_fn(granularity)
+
         if self.hessian_global_lambda == 0.0 and self.hessian_sentence_lambda == 0.0 and self.hessian_token_lambda == 0.0:
             # If lambda is 0, compute in inference mode to save resources
             with torch.inference_mode():
-                hessian_coeff = _compute_hessian_coefficients()
+                hessian_stats, full_update_stats = _compute_hessian_coefficients(g, sparse_g_dict, hessian_lambda, hessian_fn, granularity, log_gather_fn)
         else:
             # If lambda is non-zero, compute normally to allow for gradients
-            hessian_coeff = _compute_hessian_coefficients()
+            hessian_stats, full_update_stats = _compute_hessian_coefficients(g, sparse_g_dict, hessian_lambda, hessian_fn, granularity, log_gather_fn)
             
-        return hessian_coeff
+        return hessian_stats, full_update_stats
     
 
-    def _compute_and_log_fisher_curvature(self, hidden_states, one_hot_actions, softmax_probs, advantages, completion_mask, mode, prefix=""):
+    
+
+    @profiling_decorator
+    def _compute_and_log_fisher_curvature(self, h, one_hot_actions, softmax_probs, advantages, completion_mask, \
+                                            g, sparse_g_dict, granularity, mode, prefix=""):
         """
         Compute the Fisher curvature for each token in the sequence. We compute g^T F g, where F is the Fisher information matrix.
         """
-        def compute_fisher_token_level(g_flat, v, h, mask):
+        def compute_fisher_token_level(G, v, h, mask, gather_fn):
             """
             Per-token Fisher curvature.
             
             Args:
                 v: [B, T, V]
                 h: [B, T, H]
-                g_flat: [B, T, V * H]
+                G: [B, T, V, H]
             
             Returns:
                 curvature: [B, T]
             """
-            B, T, V = v.shape
-            H = h.shape[-1]
-
-            G = g_flat.view(B, T, V, H)  # [B, T, V, H]
             # einsum over batch and time
             s = torch.einsum('btv,btvh,bth->bt', v, G, h)
             return s ** 2
         
-        def compute_fisher_sentence_level(g_sent, v, h, mask, gather_fn):
+        def compute_fisher_sentence_level(G, v, h, mask, gather_fn):
             """
             Per-sentence Fisher curvature.
             
             Args:
                 v: [B, T, V]
                 h: [B, T, H]
-                g_flat: [B, V * H]
+                G: [B, T, V, H]
             
             Returns:
                 curvature: [B]
             """
-            B, T, V = v.shape
-            H = h.shape[-1]
-
-            G = g_sent.view(B, V, H)  # [B, V, H]
             # einsum over batch only
-            s = torch.einsum('btv,bvh,bth->bt', v, G, h)  # [B, T]
+            s = torch.einsum('btv,btvh,bth->bt', v, G, h)  # [B, T]
 
             fisher = s ** 2
             # mask and average over time
-            fisher = fisher * mask  # [B, T]
-            fisher = fisher.sum(dim=1)  # [B]
-            fisher = fisher / mask.sum(dim=1).clamp(min=1.0)  # [B]
+            fisher = (fisher * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)  # [B]
             return fisher  # [B]
         
-        def compute_fisher_global_level(g_sent, v, h, mask, gather_fn):
+        def compute_fisher_global_level(g_global, v, h, mask, gather_fn):
             """
             Global Fisher curvature with a single gradient direction.
             
@@ -940,21 +1542,14 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
             Returns:
                 curvature: scalar
             """
-            B, T, V = v.shape
-            H = h.shape[-1]
-            g_global = gather_fn(g_sent).mean(0)    
-
-            G = g_global.view(V, H)  # [V, H]
             # einsum globally
-            s = torch.einsum('btv,vh,bth->bt', v, G, h)  # [B, T]
+            s = torch.einsum('btv,btvh,bth->bt', v, g_global, h)  # [B, T]
 
             fisher = s ** 2
-            fisher = fisher * mask  # [B, T]
-            fisher = fisher.sum(dim=1)  # [B]
-            fisher = fisher / mask.sum(dim=1).clamp(min=1.0)  # [B]
+            fisher = (fisher * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)  # [B]
+            fisher = gather_fn(fisher).mean()
 
-            # global average
-            return gather_fn(fisher).mean()  # scalar
+            return fisher
 
         def compute_fisher_inference_wrapper(compute_fn, allow_grad):
             if allow_grad:
@@ -964,79 +1559,93 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
                     return compute_fn()
 
         # Helper function to encapsulate the calculations and logging
-        def _compute_fisher_curvatures():
+        
+        def _compute_fisher_curvatures(g, sparse_g_dict, fisher_lambda, fisher_fn, granularity, log_gather_fn=None):
             gather_fn = self.accelerator.gather
             # === Dimensions ===
             # B: batch_size, T: seq_len, V: vocab_size, H: hidden_dim, D: V * H
             batch_size, seq_len, vocab_size = softmax_probs.shape
-            hidden_dim = hidden_states[-1].shape[-1]
+            hidden_dim = h.shape[-1]
             D = vocab_size * hidden_dim  # flattened feature dimension
 
             # === 1. Extract final layer hidden states and policy info ===
-            h = hidden_states[-1, :, -seq_len:, :]             # [B, T, H]
             pi = softmax_probs                                 # [B, T, V]
             e_a = one_hot_actions.to(h.dtype)                  # [B, T, V]
             v = e_a - pi                                       # [B, T, V]
             A = advantages.unsqueeze(1).to(h.dtype)            # [B, 1]
             mask = completion_mask.to(h.dtype)                 # [B, T]
             mask_f = mask.float().to(h.dtype)
-            mask_sum = mask_f.sum(dim=1).clamp(min=1).unsqueeze(-1)  # [B, 1]
-            
 
-            # === 2. Compute token-level gradients: φ = A * (v ⊗ h) ===
-            g = A.unsqueeze(-1).unsqueeze(-1) * v.unsqueeze(-1) * h.unsqueeze(2)  # [B, T, V, H]
-            g_flat = g.view(batch_size, seq_len, -1)                            # [B, T, D]
+            # === 2. Compute effective gradients ===
+            effective_g, _ = self._compute_effective_gradients(g, sparse_g_dict)
 
-            # === 3. Compute mean gradients ===
-            # Sentence level: mean over valid tokens
-            g_sent = (g_flat * mask_f.unsqueeze(-1)).sum(1) / mask_sum         # [B, D]
-
-            # === 4. Compute Fisher curvature ===
-            fisher_token = compute_fisher_inference_wrapper(
-                lambda: compute_fisher_token_level(g_flat, v, h, mask),
-                self.fisher_token_lambda != 0.0
-            )
-            fisher_sentence = compute_fisher_inference_wrapper(
-                lambda: compute_fisher_sentence_level(g_sent, v, h, mask, gather_fn),
-                self.fisher_sentence_lambda != 0.0
-            )
-            fisher_global = compute_fisher_inference_wrapper(
-                lambda: compute_fisher_global_level(g_sent, v, h, mask, gather_fn),
-                self.fisher_global_lambda != 0.0
+            # === 3. Compute hessian coefficient ===
+            fisher = compute_fisher_inference_wrapper(
+                lambda: fisher_fn(effective_g, v, h, mask, gather_fn),
+                fisher_lambda != 0.0
             )
 
-            # KL divergence
+            # === 4. Compute full update term ===
             lr = self.lr_scheduler.get_last_lr()[0]
-            kl_token = 0.5 * fisher_token * lr**2
-            kl_sentence = 0.5 * fisher_sentence * lr**2
-            kl_global = 0.5 * fisher_global * lr**2
+            kl_term = 0.5 * fisher * lr**2
 
             # === 5. Log stats ===
-            log_fisher_stats(fisher_global.unsqueeze(0).float(), mode, f"{prefix}_global" if prefix else "global")
-            log_fisher_stats(fisher_sentence, mode, f"{prefix}_per_sentence" if prefix else "per_sentence", gather_fn=lambda t: self.accelerator.gather(t).float())
-            log_fisher_stats(fisher_token, mode, f"{prefix}_per_token" if prefix else "per_token", gather_fn=lambda t: self._gather_masked_tensor_across_processes(t, completion_mask).float())
+            if granularity == "global":
+                fisher = fisher.unsqueeze(0).float()
+                kl_term = kl_term.unsqueeze(0).float()
+            log_fisher_stats(fisher, kl_term, mode, f"{prefix}_{granularity}" if prefix else f"{granularity}", gather_fn=log_gather_fn)
 
-            curvature_stats = {
-                "global": fisher_global,
-                "sentence": fisher_sentence,
-                "token": fisher_token,
-            }
+            return fisher, kl_term
+
+
+            # # === 3. Compute Fisher curvature ===
+            # fisher_token = compute_fisher_inference_wrapper(
+            #     lambda: compute_fisher_token_level(effective_g_token, v, h),
+            #     self.fisher_token_lambda != 0.0
+            # )
+            # fisher_sentence = compute_fisher_inference_wrapper(
+            #     lambda: compute_fisher_sentence_level(effective_g_sent, v, h, mask),
+            #     self.fisher_sentence_lambda != 0.0
+            # )
+            # fisher_global = compute_fisher_inference_wrapper(
+            #     lambda: compute_fisher_global_level(effective_g_global, v, h, mask, gather_fn),
+            #     self.fisher_global_lambda != 0.0
+            # )
+
+            # # KL divergence
+            # lr = self.lr_scheduler.get_last_lr()[0]
+            # kl_token = 0.5 * fisher_token * lr**2
+            # kl_sentence = 0.5 * fisher_sentence * lr**2
+            # kl_global = 0.5 * fisher_global * lr**2
+
+            # === 5. Log stats ===
+            # log_fisher_stats(fisher_global.unsqueeze(0).float(), kl_global, mode, f"{prefix}_global" if prefix else "global")
+            # log_fisher_stats(fisher_sentence, kl_sentence, mode, f"{prefix}_per_sentence" if prefix else "per_sentence", gather_fn=lambda t: self.accelerator.gather(t).float())
+            # log_fisher_stats(fisher_token, kl_token, mode, f"{prefix}_per_token" if prefix else "per_token", gather_fn=lambda t: self._gather_masked_tensor_across_processes(t, completion_mask).float())
+
+            # curvature_stats = {
+            #     "global": fisher_global,
+            #     "sentence": fisher_sentence,
+            #     "token": fisher_token,
+            # }
             
-            kl_stats = {
-                "global": kl_global,
-                "sentence": kl_sentence,
-                "token": kl_token,
-            }
-            return curvature_stats, kl_stats
+            # kl_stats = {
+            #     "global": kl_global,
+            #     "sentence": kl_sentence,
+            #     "token": kl_token,
+            # }
+            # return curvature_stats, kl_stats
         
-        def log_fisher_stats(fisher_curvature, mode, metric_prefix, gather_fn=None):
+        def log_fisher_stats(fisher_curvature, kl_div, mode, metric_prefix, gather_fn=None):
             if gather_fn is not None:
                 gathered_fisher_curvature = gather_fn(fisher_curvature)
+                gathered_kl_div = gather_fn(kl_div)
             else:
                 gathered_fisher_curvature = fisher_curvature
+                gathered_kl_div = kl_div
             
             self._accumulate_stats(
-                data=gathered_fisher_curvature,
+                data=gathered_fisher_curvature.float(),
                 metric_name=f'{metric_prefix}_fisher_curvature',
                 mode=mode,
                 stats={
@@ -1049,23 +1658,7 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
             )
 
             self._accumulate_stats(
-                data=torch.abs(gathered_fisher_curvature),
-                metric_name=f'{metric_prefix}_fisher_curvature_abs',
-                mode=mode,
-                stats={
-                    **DEFAULT_STATS,
-                    'p85': lambda x: x.quantile(0.85).item(),
-                    'p90': lambda x: x.quantile(0.9).item(),
-                    'p95': lambda x: x.quantile(0.95).item(),
-                    'p99': lambda x: x.quantile(0.99).item(),
-                }
-            )
-
-            # log quadractic coefficient
-            lr = self.lr_scheduler.get_last_lr()[0]
-            kl_divergence = 0.5 * gathered_fisher_curvature * lr**2
-            self._accumulate_stats(
-                data=kl_divergence,
+                data=gathered_kl_div.float(),
                 metric_name=f'{metric_prefix}_fisher_kl_divergence',
                 mode=mode,
                 stats={
@@ -1077,15 +1670,29 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
                 }
             )
 
+        def _get_fisher_lambda_and_fn(granularity):
+            if granularity == "token":
+                return self.fisher_token_lambda, compute_fisher_token_level, lambda t: self._gather_masked_tensor_across_processes(t, completion_mask)
+            elif granularity == "sentence":
+                return self.fisher_sentence_lambda, compute_fisher_sentence_level, lambda t: self.accelerator.gather(t)
+            elif granularity == "global":
+                return self.fisher_global_lambda, compute_fisher_global_level, None
+
+        fisher_lambda, fisher_fn, log_gather_fn = _get_fisher_lambda_and_fn(granularity)
+
         if self.fisher_global_lambda == 0.0 and self.fisher_sentence_lambda == 0.0 and self.fisher_token_lambda == 0.0:
             # If lambda is 0, compute in inference mode to save resources
             with torch.inference_mode():
-                fisher_curvatures, approx_kl = _compute_fisher_curvatures()
+                fisher_curvatures, approx_kl = _compute_fisher_curvatures(g, sparse_g_dict, fisher_lambda, fisher_fn, granularity, log_gather_fn)
         else:
             # If lambda is non-zero, compute normally to allow for gradients
-            fisher_curvatures, approx_kl = _compute_fisher_curvatures()
+            fisher_curvatures, approx_kl = _compute_fisher_curvatures(g, sparse_g_dict, fisher_lambda, fisher_fn, granularity, log_gather_fn)
             
         return fisher_curvatures, approx_kl
+    
+    def _compute_effective_gradients(self, g, sparse_g_dict=None):
+        # TODO: implement effective gradients for Adam/AdamW
+        return g, sparse_g_dict
     
     def _smooth_logprobs(self, logprobs):
         return torch.nn.functional.softplus(logprobs +  self.softplus_alpha) - self.softplus_alpha
@@ -1182,7 +1789,7 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
             # When using num_iterations == 1, old_per_token_logps == per_token_logps, so we can skip it's
             # computation here, and use per_token_logps.detach() instead.
             # if self.num_iterations > 1:
-            old_per_token_logps, _, old_last_token_embeddings, _, _ = self._get_per_token_logps(
+            old_per_token_logps, _, old_last_token_embeddings, _, _, _ = self._get_per_token_logps(
                 self.model, prompt_completion_ids, attention_mask, logits_to_keep, return_hidden_states=True
             )
             # else:
@@ -1191,12 +1798,12 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
             if self.beta == 0.0:
                 ref_per_token_logps = None
             elif self.ref_model is not None:
-                ref_per_token_logps, _, _, _, _ = self._get_per_token_logps(
+                ref_per_token_logps, _, _, _, _, _ = self._get_per_token_logps(
                     self.ref_model, prompt_completion_ids, attention_mask, logits_to_keep
                 )
             else:
                 with self.accelerator.unwrap_model(self.model).disable_adapter():
-                    ref_per_token_logps, _, _, _, _ = self._get_per_token_logps(
+                    ref_per_token_logps, _, _, _, _, _ = self._get_per_token_logps(
                         self.model, prompt_completion_ids, attention_mask, logits_to_keep
                     )
 
@@ -1344,10 +1951,10 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
                     if metric_key not in self._metrics[mode]:
                         self._metrics[mode][metric_key] = []
                     self._metrics[mode][metric_key].append(ratio)
-
-        self._log_masked_completions(self.processing_class,completion_ids, full_mask['total'], str(self.state.epoch))
-        self._log_masked_completions(self.processing_class,completion_ids, masks_fisher['total'], f"fisher_{str(self.state.epoch)}")
-        self._log_masked_completions(self.processing_class,completion_ids, masks_hessian['total'], f"hessian_{str(self.state.epoch)}")
+        # TODO: fix logging masking completions
+        # self._log_masked_completions(self.processing_class,completion_ids, full_mask['total'], str(self.state.epoch))
+        # self._log_masked_completions(self.processing_class,completion_ids, masks_fisher['total'], f"fisher_{str(self.state.epoch)}")
+        # self._log_masked_completions(self.processing_class,completion_ids, masks_hessian['total'], f"hessian_{str(self.state.epoch)}")
 
     def _log_masked_completions(self, tokenizer, completion_ids, completion_mask, name_suffix=""):
         """
@@ -1356,9 +1963,21 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
         2. Masked tokens (decoded)
         3. Fully masked sentences (if any rows are fully masked)
         """
+        # 1. Compute original lengths before padding
+        orig_lengths = torch.full((completion_ids.size(0),), completion_ids.size(1),
+                                dtype=torch.int64, device=self.accelerator.device).contiguous()
 
-        gathered_completion_ids = self.accelerator.gather_for_metrics(completion_ids)
-        gathered_completion_mask = self.accelerator.gather_for_metrics(completion_mask)
+
+        padded_completion_ids = self.accelerator.pad_across_processes(completion_ids, dim=1, padding_value=tokenizer.pad_token_id).to(torch.int64)
+        padded_completion_mask = self.accelerator.pad_across_processes(completion_mask, dim=1, padding_value=0).to(torch.int64)
+        
+
+        gathered_completion_ids = self.accelerator.gather(padded_completion_ids)
+        gathered_completion_mask = self.accelerator.gather(padded_completion_mask)
+        gathered_orig_lengths = self.accelerator.gather(orig_lengths)
+
+        logger.info(f"orig_lengths: {orig_lengths}")
+        logger.info(f"gathered_orig_lengths: {gathered_orig_lengths}")
 
         B, T = gathered_completion_ids.shape
 
@@ -1372,8 +1991,13 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
         for b in range(B):
             mask = gathered_completion_mask[b]
             ids = gathered_completion_ids[b]
+            L = int(gathered_orig_lengths[b].item())
+
+            ids_row = gathered_completion_ids[b, :L]
+            mask_row = gathered_completion_mask[b, :L]
+
             # Get tokens that are masked and not pad
-            masked_ids = ids[mask == 0]
+            masked_ids = ids_row[mask_row == 0]
             masked_ids = masked_ids[masked_ids != tokenizer.pad_token_id]
 
             for token_id in masked_ids:
@@ -1807,7 +2431,7 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
         flat_tensor = tensor.flatten()[mask.flatten() == 1].float()
 
         # Gather the number of valid tokens from each process
-        local_length = torch.tensor([flat_tensor.shape[0]], device=flat_tensor.device)
+        local_length = torch.tensor([flat_tensor.shape[0]], device=self.accelerator.device)
         gathered_lengths = self.accelerator.gather(local_length).flatten()  # Shape: [num_processes]
 
         # Pad local tensor to max length across processes
@@ -1891,3 +2515,94 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
         # Apply mask to get all valid values
         gathered_valid_values = gathered_padded_flat_tensor[mask_valid]
         return gathered_valid_values
+
+    def _sparse_dot_product_sentence_level(self, dicts_per_sentence, effective_g_dicts_per_sentence, grad_dtype):
+        """
+        Compute the sparse dot product between g_sent and effective_g_sent,
+        using the dictionary of sequences.
+        """
+        # Initialize a dictionary to store the dot products for each sentence   
+        sentence_dot_products = []
+
+        # Iterate over each sentence in the batch
+        for i, (dict_i, effective_g_dict_i) in enumerate(zip(dicts_per_sentence, effective_g_dicts_per_sentence)):
+            # Match keys in dict_i with keys in effective_g_dict_i
+            matched_keys = dict_i.keys() & effective_g_dict_i.keys()
+            if matched_keys:
+                val = sum(torch.dot(effective_g_dict_i[k], dict_i[k]) for k in matched_keys)
+            else:
+                # both dicts empty or no overlap -> scalar 0 tensor
+                val = torch.tensor(0.0, device=self.accelerator.device, dtype=grad_dtype)
+            # Compute the dot product between the effective gradient and the dictionary
+            sentence_dot_products.append(val)
+
+        # Stack the sentence dot products into a 1D tensor
+        sentence_dot_products = torch.stack(sentence_dot_products)
+
+        return sentence_dot_products
+
+    def _sparse_dot_product_global_level(self, g_global_dict, effective_g_global_dict, grad_dtype):
+        """
+        Compute the sparse dot product between g_global and effective_g_global,
+        using the final global dictionary.
+        """
+        # Match keys in g_global with keys in effective_g_global
+        matched_keys = g_global_dict.keys() & effective_g_global_dict.keys()
+        if matched_keys:
+            val = sum(torch.dot(g_global_dict[key], effective_g_global_dict[key]) for key in matched_keys)
+        else:
+            # both dicts empty or no overlap -> scalar 0 tensor
+            val = torch.tensor(0.0, device=self.accelerator.device, dtype=grad_dtype)
+        # Compute the dot product between the effective gradient and the dictionary
+        return val
+
+    def _dict_to_tensor(self, d):
+        """
+        Convert dict[int -> torch.Tensor(N,)] 
+        into torch.Tensor(num_keys, N+1).
+        """
+        key_count_rows = []
+        grad_rows = []
+        
+        for k, v in d.items():
+            if isinstance(v, tuple):
+                grad_rows.append(v[0])
+                key_count_rows.append([k, v[1]])
+            else:
+                grad_rows.append(v)
+                key_count_rows.append([k])
+        grad_tensor = torch.stack(grad_rows)
+        key_count_tensor = torch.tensor(key_count_rows, dtype=torch.long, device=grad_tensor.device)
+        return grad_tensor, key_count_tensor
+    
+    
+    def _list_of_dicts_to_tensor(self, list_of_dicts, max_num_tokens, hidden_dim, grad_dtype, pad_value=0.0):
+        """
+        Convert a list of dict[int -> tensor(N,)] into a padded tensor of shape
+        (batch_size, max_num_tokens, N+1).
+        """
+        batch_grad_tensors = []
+        batch_key_count_tensors = []
+        for d in list_of_dicts:
+            # Convert dict to tensor
+            if not d:
+                # create grad tensor full padded with pad_value
+                grad_tensor = torch.full((max_num_tokens, hidden_dim), pad_value, device=self.accelerator.device, dtype=grad_dtype)
+                key_count_tensor = torch.full((max_num_tokens, 2), pad_value, device=self.accelerator.device, dtype=torch.long)
+            else:
+                grad_tensor, key_count_tensor = self._dict_to_tensor(d)  # (num_keys, N+1)
+                num_keys, dim = grad_tensor.shape
+            
+                # Pad or truncate to max_num_tokens
+                if num_keys < max_num_tokens:
+                    pad_size = (0, 0, 0, max_num_tokens - num_keys)  # (left,right,top,bottom)
+                    grad_tensor = torch.nn.functional.pad(grad_tensor, pad_size, value=pad_value)
+                    key_count_tensor = torch.nn.functional.pad(key_count_tensor, pad_size, value=pad_value)
+                elif num_keys > max_num_tokens:
+                    grad_tensor = grad_tensor[:max_num_tokens]
+                    key_count_tensor = key_count_tensor[:max_num_tokens]
+            
+            batch_grad_tensors.append(grad_tensor)
+            batch_key_count_tensors.append(key_count_tensor)
+        
+        return torch.stack(batch_grad_tensors), torch.stack(batch_key_count_tensors)  # (batch_size, max_num_tokens, N+1)
