@@ -12,6 +12,8 @@ import os
 from tqdm import tqdm
 from packaging import version
 from torch.utils.data import DataLoader, Sampler
+from open_r1 import sparse_grad_ops
+from open_r1.sparse_optim_models import SparseAdamModel, SparseAdamWModel, SparseSGDModel
 
 
 import transformers
@@ -91,6 +93,13 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
         self.fisher_global_mask_tau = kwargs['args'].fisher_global_mask_tau
         self.curvature_masking = any([self.hessian_token_mask_tau, self.fisher_token_mask_tau, self.hessian_sentence_mask_tau, \
                                       self.fisher_sentence_mask_tau, self.hessian_global_mask_tau, self.fisher_global_mask_tau])
+        
+        if kwargs['args'].optim_model_type == "adam":
+            self.sparse_optim_model = SparseAdamModel(adam_beta1=kwargs['args'].adam_beta1, adam_beta2=kwargs['args'].adam_beta2, adam_epsilon=kwargs['args'].adam_epsilon)
+        elif kwargs['args'].optim_model_type == "adamw":
+            self.sparse_optim_model = SparseAdamWModel(adam_beta1=kwargs['args'].adam_beta1, adam_beta2=kwargs['args'].adam_beta2, adam_epsilon=kwargs['args'].adam_epsilon, weight_decay=kwargs['args'].weight_decay)
+        else:
+            self.sparse_optim_model = SparseSGDModel()
 
 
     def _get_and_smooth_token_logps(self, model, input_ids, attention_mask, logits_to_keep, mode, return_hidden_states=False, return_entropy=False):
@@ -259,7 +268,7 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
         torch.cuda.empty_cache()
 
         ##### Compute and log gradients and curvatures #####
-        full_update_term, approx_kl = self._compute_and_log_gradients_linear_model(hidden_states, per_token_logps, probs, action_one_hot, inputs, completion_mask, top_k_token_ids, mode)
+        full_update_term, approx_kl = self._compute_and_log_gradients_linear_model(hidden_states, per_token_logps, probs, action_one_hot, inputs, completion_mask, top_k_token_ids, mode, update_optim_model=True)
 
         ###### Re-evaluate gradients and curvatures after curvature masking ######
         if self.curvature_masking:
@@ -268,7 +277,7 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
             updated_mask = completion_mask * curvature_mask_hessian * curvature_mask_fisher
 
             # Evaluate the gradients and curvatures after the curvature masking
-            self._compute_and_log_gradients_linear_model(hidden_states, per_token_logps, probs, action_one_hot, inputs, updated_mask, top_k_token_ids, mode, prefix="masked")
+            self._compute_and_log_gradients_linear_model(hidden_states, per_token_logps, probs, action_one_hot, inputs, updated_mask, top_k_token_ids, mode, prefix="masked", update_optim_model=False)
         
         torch.cuda.empty_cache()
         gathered_entropy = self._gather_masked_tensor_across_processes(entropy, completion_mask)
@@ -345,7 +354,8 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
     
 
     @profiling_decorator
-    def _compute_and_log_gradients_linear_model(self, hidden_states, per_token_logps, probs, action_one_hot, inputs, completion_mask, top_k_token_ids, mode, prefix=""):
+    @torch.no_grad()
+    def _compute_and_log_gradients_linear_model(self, hidden_states, per_token_logps, probs, action_one_hot, inputs, completion_mask, top_k_token_ids, mode, prefix="", update_optim_model=True):
         
         ######################## Compute gradients under the linear logit model ########################
         full_update_term = {}
@@ -353,31 +363,47 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
 
         ###### Token Level Gradients and Curvatures ######
         per_token_gradient = self._compute_token_level_gradients(hidden_states, probs, action_one_hot, inputs["advantages"], completion_mask, top_k_token_ids)
+        effective_per_token_gradients = self.sparse_optim_model.compute_effective_token_gradients(per_token_gradient, top_k_token_ids, self.accelerator.device)
+        token_grad_norm_sq = self._compute_grad_norm_sq(per_token_gradient, effective_per_token_gradients, None, None, "token")
         _, full_update_term['token'] = self._compute_and_log_hessian_coefficient(hidden_states, action_one_hot, probs, inputs["advantages"], completion_mask, \
-                                                        per_token_gradient, None, "token", mode, prefix)
+                                                        effective_per_token_gradients, token_grad_norm_sq, "token", mode, prefix)
         _, approx_kl['token'] = self._compute_and_log_fisher_curvature(hidden_states, action_one_hot, probs, inputs["advantages"], completion_mask, \
-                                                        per_token_gradient, None, "token", mode=mode, prefix=prefix)
+                                                        effective_per_token_gradients, "token", mode=mode, prefix=prefix)
+        del effective_per_token_gradients, token_grad_norm_sq
+        torch.cuda.empty_cache()
         
         ###### Per Sentence Gradients and Curvatures ######
+        #### 1. Sparsify the gradients
         dicts_per_sentence = self._sparsify_sentence_gradients(per_token_gradient, hidden_states.shape[-1], top_k_token_ids, completion_mask, hidden_states.dtype)
         global_dicts = self._sparsify_global_gradients(per_token_gradient, hidden_states.shape[-1], top_k_token_ids, completion_mask, hidden_states.dtype)
-        proj_per_sentence_gradient = self._compute_sentence_gradients(dicts_per_sentence, hidden_states.shape[-1], top_k_token_ids, hidden_states.dtype)
-        _, full_update_term['sentence'] = self._compute_and_log_hessian_coefficient(hidden_states, action_one_hot, probs, inputs["advantages"], completion_mask, \
-                                                        proj_per_sentence_gradient, dicts_per_sentence, "sentence", mode, prefix)
-        _, approx_kl['sentence'] = self._compute_and_log_fisher_curvature(hidden_states, action_one_hot, probs, inputs["advantages"], completion_mask, \
-                                                        proj_per_sentence_gradient, dicts_per_sentence, "sentence", mode, prefix)
         
-        # Log gradient stats, per token and per sentence
+        #### 2. Log per token gradients to free up memory
         self._log_gradients_stats(per_token_gradient, dicts_per_sentence, completion_mask, mode, prefix)
-        del per_token_gradient, proj_per_sentence_gradient, dicts_per_sentence
+        del per_token_gradient
+        torch.cuda.empty_cache()
+
+        #### 3. Compute per sentence gradients
+        effective_g_sent, sentence_grad_norm_sq = self._compute_all_sentence_gradients(dicts_per_sentence, hidden_states.shape[-1], top_k_token_ids, hidden_states.dtype)
+        _, full_update_term['sentence'] = self._compute_and_log_hessian_coefficient(hidden_states, action_one_hot, probs, inputs["advantages"], completion_mask, \
+                                                        effective_g_sent, sentence_grad_norm_sq, "sentence", mode, prefix)
+        _, approx_kl['sentence'] = self._compute_and_log_fisher_curvature(hidden_states, action_one_hot, probs, inputs["advantages"], completion_mask, \
+                                                        effective_g_sent, "sentence", mode, prefix)
+
+        del effective_g_sent, sentence_grad_norm_sq, dicts_per_sentence
+        torch.cuda.empty_cache()
 
         ###### Global Gradients and Curvatures ######
-        proj_global_gradient, final_global_dict = self._compute_global_gradients(global_dicts, hidden_states.shape[-1], top_k_token_ids, hidden_states.dtype)
+        effective_g_global, global_grad_norm_sq, final_global_dict = self._compute_all_global_gradients(global_dicts, hidden_states.shape[-1], top_k_token_ids, hidden_states.dtype)
         _, full_update_term['global'] = self._compute_and_log_hessian_coefficient(hidden_states, action_one_hot, probs, inputs["advantages"], completion_mask, \
-                                                        proj_global_gradient, final_global_dict, "global", mode, prefix)
+                                                        effective_g_global, global_grad_norm_sq, "global", mode, prefix)
         _, approx_kl['global'] = self._compute_and_log_fisher_curvature(hidden_states, action_one_hot, probs, inputs["advantages"], completion_mask, \
-                                                        proj_global_gradient, final_global_dict, "global", mode, prefix)
-        del proj_global_gradient, final_global_dict, global_dicts
+                                                        effective_g_global, "global", mode, prefix)
+
+        
+        if update_optim_model:
+            self.sparse_optim_model.update_effective_gradient_moments(final_global_dict)
+
+        del effective_g_global, global_grad_norm_sq, global_dicts, final_global_dict
 
         torch.cuda.empty_cache()
 
@@ -485,6 +511,17 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
                        for i, k in enumerate(uniq_ids_g)}
         return global_dict
         
+    @profiling_decorator
+    def _compute_all_sentence_gradients(self, dicts_per_sentence, hidden_dim, token_ids, grad_dtype):
+        """
+        This function computes the gradients per sentence, including effective gradients.
+        """
+        effective_g_sent_dicts = self.sparse_optim_model.compute_effective_sentence_gradients(dicts_per_sentence)
+        effective_g_sent = self._compute_sentence_gradients(effective_g_sent_dicts, hidden_dim, token_ids, grad_dtype)
+        sentence_grad_norm_sq = self._compute_grad_norm_sq(None, effective_g_sent, dicts_per_sentence, effective_g_sent_dicts, "sentence")
+
+        del effective_g_sent_dicts
+        return effective_g_sent, sentence_grad_norm_sq
     
     @profiling_decorator
     def _compute_sentence_gradients(self, dicts_per_sentence, hidden_dim, token_ids, grad_dtype):
@@ -576,11 +613,15 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
 
         sentence_gradient = grad_tensor_sentence_flat.view(batch_size, seq_len, topk_size, hidden_dim)  # [B, T, V, H]
         del grad_tensor_sentence_flat
+        torch.cuda.empty_cache()
          
         return sentence_gradient
-    
+        
     @profiling_decorator
-    def _compute_global_gradients(self, global_dict, hidden_dim, token_ids, grad_dtype):
+    def _compute_all_global_gradients(self, global_dict, hidden_dim, token_ids, grad_dtype):
+        """
+        This function computes the gradients per global level, including effective gradients.
+        """
         """
         This function computes the gradients per global level.
         While computing the curvatures later on, to once again exploit sparsity, we need to map the gradients back to their corresponding subspaces.
@@ -595,7 +636,9 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
         if max_keys == 0:
             final_global_dict = {}
             global_gradient = torch.zeros((batch_size, seq_len, topk_size, hidden_dim), dtype=grad_dtype, device=self.accelerator.device)
-            return global_gradient, final_global_dict
+            # norm sq is a zero for the full batch
+            global_grad_norm_sq = torch.zeros(1, dtype=grad_dtype, device=self.accelerator.device)
+            return global_gradient, global_grad_norm_sq, final_global_dict
 
         global_dict_tensor, key_count_tensor = self._list_of_dicts_to_tensor([global_dict], max_num_tokens=max_keys, hidden_dim=hidden_dim, grad_dtype=grad_dtype)
         gathered_global_dict_tensor = gather_fn(global_dict_tensor)
@@ -603,39 +646,29 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
 
         # Aggregate the global dictionary, returning the average gradient per token_id
         final_global_dict = self.aggregate_global_dict(gathered_global_dict_tensor, gathered_key_count_tensor, num_keys)
+        del gathered_global_dict_tensor, gathered_key_count_tensor, global_dict_tensor, key_count_tensor
+        torch.cuda.empty_cache()
 
+
+        effective_final_global_dict = self.sparse_optim_model.compute_effective_global_gradients(final_global_dict)
+        effective_g_global = self._compute_global_gradients(effective_final_global_dict, hidden_dim, token_ids, grad_dtype)
+        global_grad_norm_sq = self._compute_grad_norm_sq(None, effective_g_global, final_global_dict, effective_final_global_dict, "global")
+        del effective_final_global_dict
+        torch.cuda.empty_cache()
+
+        return effective_g_global, global_grad_norm_sq, final_global_dict
+    
+    @profiling_decorator
+    def _compute_global_gradients(self, final_global_dict, hidden_dim, token_ids, grad_dtype):
+        batch_size, seq_len, topk_size = token_ids.shape
         if not final_global_dict:
             global_gradient = torch.zeros((batch_size, seq_len, topk_size, hidden_dim), dtype=grad_dtype, device=self.accelerator.device)
-            return global_gradient, final_global_dict
+            return global_gradient
 
         ############ We now map the global gradient back to the dense representation
-        # 0) Flatten token_ids for indexing
-        token_ids_flat_global = token_ids.flatten()  # [B*T*V]
+        global_gradient = sparse_grad_ops.densify_gradient_dict(final_global_dict, token_ids, grad_dtype, self.accelerator.device)
+        return global_gradient
 
-        # 1) Build tensors of keys and grads
-        keys = torch.tensor(list(final_global_dict.keys()), device=self.accelerator.device, dtype=torch.long)   # [U]
-        grads = torch.stack(list(final_global_dict.values())).to(self.accelerator.device, dtype=grad_dtype)     # [U, H]
-
-        # 2) Sort keys once, and align grads to that order
-        keys_sorted, order = torch.sort(keys)                       # [U]
-        grads_sorted = grads.index_select(0, order)                 # [U, H]
-
-        # 3) Map each token id to its index in keys_sorted via searchsorted (O(N log U))
-        idx = torch.searchsorted(keys_sorted, token_ids_flat_global)  # [N]
-        # (If some token_ids might be missing, guard it)
-        valid = (idx < keys_sorted.numel()) & (keys_sorted[idx] == token_ids_flat_global)
-        # 4) Gather in one shot
-        grad_tensor_global_flat = torch.zeros(
-            (token_ids_flat_global.numel(), grads_sorted.size(1)),
-            dtype=grad_dtype, device=self.accelerator.device
-        )
-        grad_tensor_global_flat[valid] = grads_sorted.index_select(0, idx[valid])
-
-        global_gradient = grad_tensor_global_flat.view(batch_size, seq_len, topk_size, -1)
-        
-        del grad_tensor_global_flat, token_ids_flat_global, keys, grads, keys_sorted, order, idx, valid
-        del gathered_global_dict_tensor, gathered_key_count_tensor, global_dict_tensor, key_count_tensor
-        return global_gradient, final_global_dict
     
     # gathered_global_dict_tensor: iterable of 2D tensors shaped [N_i, D]
     # num_keys: iterable of ints (valid rows in each corresponding tensor)
@@ -1213,7 +1246,7 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
 
     @profiling_decorator
     def _compute_and_log_hessian_coefficient(self, h, one_hot_actions, softmax_probs, advantages, completion_mask, 
-                                             g, sparse_g_dict, granularity, mode, prefix=""):
+                                             effective_g, grad_norm_sq, granularity, mode, prefix=""):
         """
         Compute the hessian coefficient for each token in the sequence.
         """
@@ -1281,7 +1314,7 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
                     return compute_fn()
                 
         # Helper function to encapsulate the calculations and logging
-        def _compute_hessian_coefficients(g, sparse_g_dict, hessian_lambda, hessian_fn, granularity, log_gather_fn=None):
+        def _compute_hessian_coefficients(effective_g, grad_norm_sq, hessian_lambda, hessian_fn, granularity, log_gather_fn=None):
             gather_fn = self.accelerator.gather
             # === Dimensions ===
             # B: batch_size, T: seq_len, V: vocab_size, H: hidden_dim, D: V * H
@@ -1295,45 +1328,24 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
             v = e_a - pi                                       # [B, T, V]
             A = advantages.unsqueeze(1).to(h.dtype)            # [B, 1]
             mask = completion_mask.to(h.dtype)                 # [B, T]
-            
-            # === 2. Compute effective gradients ===
-            effective_g, effective_g_dict = self._compute_effective_gradients(g, sparse_g_dict)
 
-            # === 3. Compute hessian coefficient ===
+            # === 2. Compute hessian coefficient ===
             hessian = compute_hessian_inference_wrapper(
                 lambda: hessian_fn(effective_g, A, v, h, pi, mask, gather_fn),
                 hessian_lambda != 0.0
             )
 
-            # === 4. Compute full update term ===
+            # === 3. Compute full update term ===
             lr = self.lr_scheduler.get_last_lr()[0]
-
-            grad_norm_sq = _compute_grad_norm_sq(g, effective_g, sparse_g_dict, effective_g_dict, granularity)
 
             full_update_term = lr * grad_norm_sq + 0.5 * hessian * lr**2
 
-            # === 5. Log stats ===
+            # === 4. Log stats ===
             if granularity == "global":
                 hessian = hessian.unsqueeze(0).float()
                 full_update_term = full_update_term.unsqueeze(0).float()
             log_hessian_stats(hessian, full_update_term, mode, f"{prefix}_{granularity}" if prefix else f"{granularity}", gather_fn=log_gather_fn)
             return hessian, full_update_term
-        
-        def _compute_grad_norm_sq(g, effective_g, sparse_g_dict, effective_g_dict, granularity):
-            if granularity == "token":
-                # Token-level grad norm: simple dot product, as the logits map directly from g_token to effective_g_token. Using bmm to avoid materializing big tensors.
-                B, T, V, H = g.shape
-                bt = B * T
-                token_grad_norm_sq = torch.bmm(
-                    g.reshape(bt, 1, V * H).contiguous(),
-                    effective_g.reshape(bt, V * H, 1).contiguous()
-                ).reshape(B, T)
-                return token_grad_norm_sq
-            
-            if granularity == "sentence":
-                return self._sparse_dot_product_sentence_level(sparse_g_dict, effective_g_dict, g.dtype)
-            elif granularity == "global":
-                return self._sparse_dot_product_global_level(sparse_g_dict, effective_g_dict, g.dtype)
 
         # # Helper function to encapsulate the calculations and logging
         # def _compute_hessian_coefficients():
@@ -1478,10 +1490,10 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
         if self.hessian_global_lambda == 0.0 and self.hessian_sentence_lambda == 0.0 and self.hessian_token_lambda == 0.0:
             # If lambda is 0, compute in inference mode to save resources
             with torch.inference_mode():
-                hessian_stats, full_update_stats = _compute_hessian_coefficients(g, sparse_g_dict, hessian_lambda, hessian_fn, granularity, log_gather_fn)
+                hessian_stats, full_update_stats = _compute_hessian_coefficients(effective_g, grad_norm_sq, hessian_lambda, hessian_fn, granularity, log_gather_fn)
         else:
             # If lambda is non-zero, compute normally to allow for gradients
-            hessian_stats, full_update_stats = _compute_hessian_coefficients(g, sparse_g_dict, hessian_lambda, hessian_fn, granularity, log_gather_fn)
+            hessian_stats, full_update_stats = _compute_hessian_coefficients(effective_g, grad_norm_sq, hessian_lambda, hessian_fn, granularity, log_gather_fn)
             
         return hessian_stats, full_update_stats
     
@@ -1490,7 +1502,7 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
 
     @profiling_decorator
     def _compute_and_log_fisher_curvature(self, h, one_hot_actions, softmax_probs, advantages, completion_mask, \
-                                            g, sparse_g_dict, granularity, mode, prefix=""):
+                                            effective_g, granularity, mode, prefix=""):
         """
         Compute the Fisher curvature for each token in the sequence. We compute g^T F g, where F is the Fisher information matrix.
         """
@@ -1560,7 +1572,7 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
 
         # Helper function to encapsulate the calculations and logging
         
-        def _compute_fisher_curvatures(g, sparse_g_dict, fisher_lambda, fisher_fn, granularity, log_gather_fn=None):
+        def _compute_fisher_curvatures(fisher_lambda, fisher_fn, granularity, log_gather_fn=None):
             gather_fn = self.accelerator.gather
             # === Dimensions ===
             # B: batch_size, T: seq_len, V: vocab_size, H: hidden_dim, D: V * H
@@ -1576,20 +1588,17 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
             mask = completion_mask.to(h.dtype)                 # [B, T]
             mask_f = mask.float().to(h.dtype)
 
-            # === 2. Compute effective gradients ===
-            effective_g, _ = self._compute_effective_gradients(g, sparse_g_dict)
-
-            # === 3. Compute hessian coefficient ===
+            # === 2. Compute hessian coefficient ===
             fisher = compute_fisher_inference_wrapper(
                 lambda: fisher_fn(effective_g, v, h, mask, gather_fn),
                 fisher_lambda != 0.0
             )
 
-            # === 4. Compute full update term ===
+            # === 3. Compute full update term ===
             lr = self.lr_scheduler.get_last_lr()[0]
             kl_term = 0.5 * fisher * lr**2
 
-            # === 5. Log stats ===
+            # === 4. Log stats ===
             if granularity == "global":
                 fisher = fisher.unsqueeze(0).float()
                 kl_term = kl_term.unsqueeze(0).float()
@@ -1683,16 +1692,12 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
         if self.fisher_global_lambda == 0.0 and self.fisher_sentence_lambda == 0.0 and self.fisher_token_lambda == 0.0:
             # If lambda is 0, compute in inference mode to save resources
             with torch.inference_mode():
-                fisher_curvatures, approx_kl = _compute_fisher_curvatures(g, sparse_g_dict, fisher_lambda, fisher_fn, granularity, log_gather_fn)
+                fisher_curvatures, approx_kl = _compute_fisher_curvatures(fisher_lambda, fisher_fn, granularity, log_gather_fn)
         else:
             # If lambda is non-zero, compute normally to allow for gradients
-            fisher_curvatures, approx_kl = _compute_fisher_curvatures(g, sparse_g_dict, fisher_lambda, fisher_fn, granularity, log_gather_fn)
+            fisher_curvatures, approx_kl = _compute_fisher_curvatures(fisher_lambda, fisher_fn, granularity, log_gather_fn)
             
         return fisher_curvatures, approx_kl
-    
-    def _compute_effective_gradients(self, g, sparse_g_dict=None):
-        # TODO: implement effective gradients for Adam/AdamW
-        return g, sparse_g_dict
     
     def _smooth_logprobs(self, logprobs):
         return torch.nn.functional.softplus(logprobs +  self.softplus_alpha) - self.softplus_alpha
@@ -2515,6 +2520,23 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
         # Apply mask to get all valid values
         gathered_valid_values = gathered_padded_flat_tensor[mask_valid]
         return gathered_valid_values
+
+
+    def _compute_grad_norm_sq(self, g, effective_g, sparse_g_dict, effective_g_dict, granularity):
+            if granularity == "token":
+                # Token-level grad norm: simple dot product, as the logits map directly from g_token to effective_g_token. Using bmm to avoid materializing big tensors.
+                B, T, V, H = g.shape
+                bt = B * T
+                token_grad_norm_sq = torch.bmm(
+                    g.reshape(bt, 1, V * H).contiguous(),
+                    effective_g.reshape(bt, V * H, 1).contiguous()
+                ).reshape(B, T)
+                return token_grad_norm_sq
+            
+            if granularity == "sentence":
+                return self._sparse_dot_product_sentence_level(sparse_g_dict, effective_g_dict, effective_g.dtype)
+            elif granularity == "global":
+                return self._sparse_dot_product_global_level(sparse_g_dict, effective_g_dict, effective_g.dtype)
 
     def _sparse_dot_product_sentence_level(self, dicts_per_sentence, effective_g_dicts_per_sentence, grad_dtype):
         """

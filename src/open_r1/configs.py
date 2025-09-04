@@ -88,6 +88,8 @@ class GRPOConfig(trl.GRPOConfig):
     hessian_global_mask_tau: float = field(default=0.0, metadata={"help": "The masking coefficient for the hessian at global level."})
     fisher_global_mask_tau: float = field(default=0.0, metadata={"help": "The masking coefficient for the fisher at global level."})
 
+    # Sparse Optimizer
+    optim_model_type: str = field(default="sgd", metadata={"help": "The type of optimizer to use. Possible values: adam, adamw, sgd."})
 
 
 
