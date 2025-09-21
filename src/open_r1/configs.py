@@ -91,6 +91,9 @@ class GRPOConfig(trl.GRPOConfig):
     # Sparse Optimizer
     optim_model_type: str = field(default="sgd", metadata={"help": "The type of optimizer to use. Possible values: adam, adamw, sgd."})
 
+    sequential_masking: bool = field(default=False, metadata={"help": "Whether to mask tokens sequentially."})
+    hessian_symmetric_clipping: bool = field(default=False, metadata={"help": "Whether to symmetrically clip the hessian."})
+
 
 
 @dataclass

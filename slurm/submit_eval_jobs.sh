@@ -10,9 +10,10 @@ HF_PREFIX=$8 # "luckeciano"
 WANDB_PREFIX=$9 # "/scratch-ssd/lucelo/grad-stability/data"
 MAX_MODEL_LENGTH=${10} # 4096
 GPU_TYPE=${11} # "h100"
-TENSOR_PARALLEL=${12:-False}
-TRUST_REMOTE_CODE=${13:-False}
-SYSTEM_PROMPT=${14}
+PREV_JOB_ID=${12} # Optional: Job ID to wait for before starting first job
+TENSOR_PARALLEL=${13:-False}
+TRUST_REMOTE_CODE=${14:-False}
+SYSTEM_PROMPT=${15}
 
 echo "Fetching model revisions..."
 # Run the Python script and capture both stdout and stderr
@@ -36,10 +37,12 @@ for entry in $MODEL_REVISIONS; do
     fi
 done
 
+# Initialize the job dependency chain with the provided PREV_JOB_ID
+CURRENT_PREV_JOB_ID="$PREV_JOB_ID"
+
 # Iterate per model, then per revision
 for MODEL_ID in "${!model_revisions[@]}"; do
     echo "Processing model: $MODEL_ID"
-    PREV_JOB_ID=""
     
     for entry in ${model_revisions["$MODEL_ID"]}; do
         STEP=$(echo $entry | cut -d':' -f1)
@@ -48,8 +51,8 @@ for MODEL_ID in "${!model_revisions[@]}"; do
         echo "Preparing job for MODEL=$MODEL_ID, STEP=$STEP, REVISION=$MODEL_REVISION, WANDB_PATH=$WANDB_RUN_PATH"
 
         CMD="sbatch --exclude=oat18"
-        if [ -n "$PREV_JOB_ID" ]; then
-            CMD+=" --dependency=afterany:$PREV_JOB_ID"
+        if [ -n "$CURRENT_PREV_JOB_ID" ]; then
+            CMD+=" --dependency=afterany:$CURRENT_PREV_JOB_ID"
         fi
 
         if [ "$GPU_TYPE" == "h100" ]; then
@@ -65,6 +68,6 @@ for MODEL_ID in "${!model_revisions[@]}"; do
         fi
 
         echo "$JOB_SUBMIT_OUTPUT"
-        PREV_JOB_ID=$(echo "$JOB_SUBMIT_OUTPUT" | grep -oP '\d+')
+        CURRENT_PREV_JOB_ID=$(echo "$JOB_SUBMIT_OUTPUT" | grep -oP '\d+')
     done
 done

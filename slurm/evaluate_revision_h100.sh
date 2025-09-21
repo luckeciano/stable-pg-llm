@@ -1,6 +1,6 @@
 #!/bin/bash
-#SBATCH --cpus-per-task=12
-#SBATCH --gres=gpu:h100:1
+#SBATCH --cpus-per-task=48
+#SBATCH --gres=gpu:h100:4
 #SBATCH --nodes=1
 #SBATCH --job-name="eval-revision"
 #SBATCH --partition=h100
@@ -28,6 +28,14 @@ rm -rf ~/.cache/pip
 export PIP_NO_CACHE_DIR=1
 export PIP_DEFAULT_TIMEOUT=100
 export PYTHONWARNINGS="ignore::DeprecationWarning"
+
+
+export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+export NCCL_DEBUG=WARN
+export NCCL_ASYNC_ERROR_HANDLING=1
+export NCCL_BLOCKING_WAIT=1
+export NCCL_P2P_DISABLE=1
+export CUDA_LAUNCH_BLOCKING=1
 
 /scratch-ssd/oatml/run_locked.sh /scratch-ssd/oatml/miniconda3/bin/conda-env update -f ~/maxent-rl-r1/environment.yml
 source /scratch-ssd/oatml/miniconda3/bin/activate maxent-r1-lucelo

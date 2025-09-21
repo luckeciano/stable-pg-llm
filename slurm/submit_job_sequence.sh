@@ -83,7 +83,7 @@ for ((i=1; i<=$NUM_JOBS; i++)); do
     fi
     
     # Add job name
-    SBATCH_CMD="$SBATCH_CMD --job-name=\"$SEQUENCE_JOB_NAME\" --exclude=oat18"
+    SBATCH_CMD="$SBATCH_CMD --job-name=\"$SEQUENCE_JOB_NAME\" --exclude=oat18,oat17"
     
     # Submit the job
     echo "  Command: $SBATCH_CMD $TRAIN_SCRIPT $MODEL $TASK $CONFIG_SUFFIX $ACCELERATOR $SEED"

@@ -16,7 +16,7 @@
 
 import random
 
-from open_r1.utils.custom_metrics import make_metrics_at_k
+from open_r1.utils.custom_metrics import make_metrics_at_k, multilingual_extractive_match_metric_robust
 
 from lighteval.metrics.dynamic_metrics import (
     ExprExtractionConfig,
@@ -56,7 +56,7 @@ k_values = [1]
 
 print(f"k_values: {k_values}")
 
-latex_gold_metric = multilingual_extractive_match_metric(
+latex_gold_metric = multilingual_extractive_match_metric_robust(
     language=Language.ENGLISH,
     fallback_mode="first_match",
     precision=5,
@@ -67,7 +67,7 @@ latex_gold_metric = multilingual_extractive_match_metric(
     timeout_seconds=1
 )
 
-expr_gold_metric = multilingual_extractive_match_metric(
+expr_gold_metric = multilingual_extractive_match_metric_robust(
     language=Language.ENGLISH,
     fallback_mode="first_match",
     precision=5,
@@ -78,7 +78,7 @@ expr_gold_metric = multilingual_extractive_match_metric(
     timeout_seconds=1
 )
 
-gpqa_metric = multilingual_extractive_match_metric(
+gpqa_metric = multilingual_extractive_match_metric_robust(
     language=Language.ENGLISH,
     gold_extraction_target=[IndicesExtractionConfig(prefix_for_extraction="NativeLetters")],
     pred_extraction_target=[IndicesExtractionConfig(prefix_for_extraction="NativeLetters")],
@@ -86,7 +86,7 @@ gpqa_metric = multilingual_extractive_match_metric(
     timeout_seconds=1
 )
 
-minerva_metric = multilingual_extractive_match_metric(
+minerva_metric = multilingual_extractive_match_metric_robust(
     language=Language.ENGLISH,
     fallback_mode="first_match",
     precision=5,
@@ -97,7 +97,7 @@ minerva_metric = multilingual_extractive_match_metric(
     timeout_seconds=1
 )
 
-olympiadbench_metric = multilingual_extractive_match_metric(
+olympiadbench_metric = multilingual_extractive_match_metric_robust(
     language=Language.ENGLISH,
     precision=5,
     gold_extraction_target=(LatexExtractionConfig(), ExprExtractionConfig()),

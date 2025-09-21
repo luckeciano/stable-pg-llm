@@ -211,6 +211,10 @@ def main(script_args, training_args, model_args):
     # Load tokenizer
     ################
     tokenizer = get_tokenizer(model_args, training_args)
+    # --- Make Llama-3.1 play nice with padding ---
+    # Use EOS as PAD (no vocab resize)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
     # Map reward functions to their implementations
     reward_mapping = {
