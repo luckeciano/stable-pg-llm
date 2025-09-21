@@ -93,6 +93,7 @@ class GRPOConfig(trl.GRPOConfig):
 
     sequential_masking: bool = field(default=False, metadata={"help": "Whether to mask tokens sequentially."})
     hessian_symmetric_clipping: bool = field(default=False, metadata={"help": "Whether to symmetrically clip the hessian."})
+    capo_only: bool = field(default=False, metadata={"help": "Whether to only compute the token-level CAPO."})
 
 
 

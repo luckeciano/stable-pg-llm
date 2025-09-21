@@ -104,6 +104,10 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
         else:
             self.sparse_optim_model = SparseSGDModel()
 
+        self.capo_only = kwargs['args'].capo_only
+        if self.capo_only and any([self.fisher_sentence_mask_tau,  self.hessian_sentence_mask_tau, self.fisher_global_mask_tau, self.hessian_global_mask_tau]):
+            raise ValueError("The 'capo_only' flag is designed for evaluating the token-level CAPO, not the sentence-level or global-level CAPO.")
+
 
     def _get_and_smooth_token_logps(self, model, input_ids, attention_mask, logits_to_keep, mode, return_hidden_states=False, return_entropy=False):
         per_token_logps, entropy, embeddings, probs, action_one_hot, top_k_token_ids = self._get_per_token_logps(model, input_ids, attention_mask, logits_to_keep, return_hidden_states=return_hidden_states, return_entropy=return_entropy)
@@ -376,7 +380,7 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
 
         ###### Token Level Gradients and Curvatures ######
         per_token_gradient = self._compute_token_level_gradients(hidden_states, probs, action_one_hot, inputs["advantages"], completion_mask, top_k_token_ids)
-        effective_per_token_gradients = self.sparse_optim_model.compute_effective_token_gradients(per_token_gradient, top_k_token_ids, self.accelerator.device)
+        effective_per_token_gradients = self._compute_effective_token_gradients(per_token_gradient, top_k_token_ids)
         token_grad_norm_sq = self._compute_grad_norm_sq(per_token_gradient, effective_per_token_gradients, None, None, "token")
         _, full_update_term['token'] = self._compute_and_log_hessian_coefficient(hidden_states, action_one_hot, probs, inputs["advantages"], completion_mask, \
                                                         effective_per_token_gradients, token_grad_norm_sq, "token", mode, prefix)
@@ -384,6 +388,13 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
                                                         effective_per_token_gradients, "token", mode=mode, prefix=prefix)
         del effective_per_token_gradients, token_grad_norm_sq
         torch.cuda.empty_cache()
+
+        if self.capo_only:
+            if update_optim_model:
+                self._capo_only_update_adam_moments(per_token_gradient, hidden_states.shape[-1], top_k_token_ids, completion_mask, hidden_states.dtype)
+                torch.cuda.empty_cache()    
+            return full_update_term, approx_kl
+
         
         ###### Per Sentence Gradients and Curvatures ######
         #### 1. Sparsify the gradients
@@ -670,7 +681,9 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
         final_global_dict = self.aggregate_global_dict(gathered_global_dict_tensor, gathered_key_count_tensor, num_keys)
         del gathered_global_dict_tensor, gathered_key_count_tensor, global_dict_tensor, key_count_tensor
         torch.cuda.empty_cache()
-
+        
+        if self.capo_only:
+            return final_global_dict
 
         effective_final_global_dict = self.sparse_optim_model.compute_effective_global_gradients(final_global_dict)
         effective_g_global = self._compute_global_gradients(effective_final_global_dict, hidden_dim, token_ids, grad_dtype)
@@ -741,7 +754,21 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
                 
         return final_global_dict
 
+    @profiling_decorator
+    def _capo_only_update_adam_moments(self, per_token_gradient, hidden_states_shape, top_k_token_ids, completion_mask, hidden_states_dtype):
+        """
+        This function performs a meta-step for the CAPO-only mode.
+        It computes the global gradients and updates the effective gradient moments.
+        """
 
+        global_dicts = self._sparsify_global_gradients(per_token_gradient, hidden_states_shape, top_k_token_ids, completion_mask, hidden_states_dtype)
+        final_global_dict = self._compute_all_global_gradients(global_dicts, hidden_states_shape, top_k_token_ids, hidden_states_dtype)
+        self.sparse_optim_model.update_effective_gradient_moments(final_global_dict)
+
+    @profiling_decorator
+    def _compute_effective_token_gradients(self, per_token_gradient, top_k_token_ids):
+        return self.sparse_optim_model.compute_effective_token_gradients(per_token_gradient, top_k_token_ids, self.accelerator.device)
+        
     @profiling_decorator
     def _compute_gradients(self, h, per_token_logps, softmax_probs, one_hot_actions, advantages, completion_mask, token_ids):
         """
@@ -907,7 +934,7 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
         return g, sentence_gradient, global_gradient, dicts_per_sentence, final_global_dict
             
 
-
+    @profiling_decorator
     def _compute_hessian_curvature_mask(self, full_update_term, completion_mask):
         curvature_mask = torch.ones_like(completion_mask)
         if full_update_term is None:
@@ -921,6 +948,7 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
         masks["total"] = curvature_mask
         return curvature_mask, masks
     
+    @profiling_decorator
     def _compute_fisher_curvature_mask(self, approx_kl, completion_mask):
         curvature_mask = torch.ones_like(completion_mask)
 
