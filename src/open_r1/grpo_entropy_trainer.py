@@ -2084,110 +2084,192 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
                         self._metrics[mode][metric_key] = []
                     self._metrics[mode][metric_key].append(ratio)
         # TODO: fix logging masking completions
-        # self._log_masked_completions(self.processing_class,completion_ids, full_mask['total'], str(self.state.epoch))
-        # self._log_masked_completions(self.processing_class,completion_ids, masks_fisher['total'], f"fisher_{str(self.state.epoch)}")
-        # self._log_masked_completions(self.processing_class,completion_ids, masks_hessian['total'], f"hessian_{str(self.state.epoch)}")
+        self._log_masked_completions(self.processing_class,completion_ids, full_mask['total'], str(self.state.epoch))
+        self._log_masked_completions(self.processing_class,completion_ids, masks_fisher['total'], f"fisher_{str(self.state.epoch)}")
+        self._log_masked_completions(self.processing_class,completion_ids, masks_hessian['total'], f"hessian_{str(self.state.epoch)}")
 
     def _log_masked_completions(self, tokenizer, completion_ids, completion_mask, name_suffix=""):
         """
-        Logs three text files via wandb.Artifact:
-        1. Masked token IDs
-        2. Masked tokens (decoded)
-        3. Fully masked sentences (if any rows are fully masked)
+        Create and log:
+        1) masked_tokens_per_sentence_{suffix}.txt  - decoded masked tokens per sentence
+        2) all_sentences_{suffix}.txt                - decoded full sentences (no pads)
+        3) masked_token_freq_{suffix}.json          - frequency dictionary of masked tokens
+        4) all_token_freq_{suffix}.json             - frequency dictionary of all tokens
         """
-        # 1. Compute original lengths before padding
-        orig_lengths = torch.full((completion_ids.size(0),), completion_ids.size(1),
-                                dtype=torch.int64, device=self.accelerator.device).contiguous()
+        import io, os, json, tempfile, wandb
+        import torch
+        from collections import Counter
 
+        acc = self.accelerator
+        device = acc.device
 
-        padded_completion_ids = self.accelerator.pad_across_processes(completion_ids, dim=1, padding_value=tokenizer.pad_token_id).to(torch.int64)
-        padded_completion_mask = self.accelerator.pad_across_processes(completion_mask, dim=1, padding_value=0).to(torch.int64)
-        
-
-        gathered_completion_ids = self.accelerator.gather(padded_completion_ids)
-        gathered_completion_mask = self.accelerator.gather(padded_completion_mask)
-        gathered_orig_lengths = self.accelerator.gather(orig_lengths)
-
-        logger.info(f"orig_lengths: {orig_lengths}")
-        logger.info(f"gathered_orig_lengths: {gathered_orig_lengths}")
-
-        B, T = gathered_completion_ids.shape
-
-        # Create in-memory string buffers
-        buf_ids = io.StringIO()
-        buf_tokens = io.StringIO()
-        buf_sentences = io.StringIO()
-
+        assert tokenizer.pad_token_id is not None, "tokenizer.pad_token_id must be set."
+        pad_id = tokenizer.pad_token_id
         vocab_size = tokenizer.vocab_size
 
+        # -------------------------
+        # 0) Make shapes consistent across ranks
+        # -------------------------
+        orig_lengths = torch.full(
+            (completion_ids.size(0),),
+            completion_ids.size(1),
+            dtype=torch.int64,
+            device=device,
+        ).contiguous()
+
+        ids_T = acc.pad_across_processes(completion_ids, dim=1, pad_index=pad_id).to(torch.int64)
+        mask_T = acc.pad_across_processes(completion_mask, dim=1, pad_index=0).to(torch.int64)
+
+        local_bs = ids_T.size(0)
+        T = ids_T.size(1)
+        local_bs_tensor = torch.tensor([local_bs], device=device, dtype=torch.int64)
+        all_bs = acc.gather(local_bs_tensor)
+        max_bs = int(all_bs.max().item())
+
+        if local_bs < max_bs:
+            pad_rows = max_bs - local_bs
+            pad_ids_rows = torch.full((pad_rows, T), pad_id, dtype=torch.int64, device=device)
+            pad_mask_rows = torch.zeros((pad_rows, T), dtype=torch.int64, device=device)
+            pad_len_rows = torch.zeros((pad_rows,), dtype=torch.int64, device=device)
+            ids_T = torch.cat([ids_T, pad_ids_rows], dim=0)
+            mask_T = torch.cat([mask_T, pad_mask_rows], dim=0)
+            orig_lengths = torch.cat([orig_lengths, pad_len_rows], dim=0)
+
+        g_ids = acc.gather(ids_T).cpu()
+        g_mask = acc.gather(mask_T).cpu()
+        g_len = acc.gather(orig_lengths).cpu()
+
+        B, T = g_ids.shape
+
+        # -------------------------
+        # 1) Valid positions
+        # -------------------------
+        row_idx = torch.arange(T).unsqueeze(0).expand(B, -1)
+        valid_pos = row_idx < g_len.unsqueeze(1)
+
+        ids_np = g_ids.numpy()
+        mask_np = g_mask.numpy()
+        len_np = g_len.numpy()
+
+        # -------------------------
+        # 2) Collect all IDs
+        # -------------------------
+        sel_masked = (g_mask == 0) & valid_pos & (g_ids != pad_id)
+        masked_ids_flat = torch.masked_select(g_ids, sel_masked).tolist()
+
+        sel_all = valid_pos & (g_ids != pad_id)
+        all_ids_flat = torch.masked_select(g_ids, sel_all).tolist()
+
+        def unique_valid_ids(ids_list):
+            if not ids_list:
+                return []
+            return sorted({tid for tid in ids_list if 0 <= tid < vocab_size})
+
+        unique_union = sorted(set(unique_valid_ids(masked_ids_flat)).union(unique_valid_ids(all_ids_flat)))
+
+        id_to_decoded = {}
+        if unique_union:
+            decoded_union = tokenizer.batch_decode([[tid] for tid in unique_union], skip_special_tokens=True)
+            id_to_decoded.update(zip(unique_union, decoded_union))
+
+        def decode_token_id(tid):
+            if 0 <= tid < vocab_size:
+                s = id_to_decoded.get(tid, "")
+                return s if s else None
+            return None
+
+        # -------------------------
+        # 3) Masked tokens per sentence + freq
+        # -------------------------
+        masked_buf = io.StringIO()
+        masked_freq = Counter()
+
         for b in range(B):
-            mask = gathered_completion_mask[b]
-            ids = gathered_completion_ids[b]
-            L = int(gathered_orig_lengths[b].item())
+            L = int(len_np[b])
+            if L <= 0:
+                masked_buf.write("\n")
+                continue
+            ids_row = ids_np[b, :L]
+            mask_row = mask_np[b, :L]
 
-            ids_row = gathered_completion_ids[b, :L]
-            mask_row = gathered_completion_mask[b, :L]
+            masked_toks_row = []
+            for tid, m in zip(ids_row, mask_row):
+                if m == 0 and tid != pad_id:
+                    tok = decode_token_id(int(tid))
+                    if tok:
+                        masked_toks_row.append(tok)
 
-            # Get tokens that are masked and not pad
-            masked_ids = ids_row[mask_row == 0]
-            masked_ids = masked_ids[masked_ids != tokenizer.pad_token_id]
+            masked_buf.write((" ".join(masked_toks_row)) + "\n")
 
-            for token_id in masked_ids:
-                token_id_val = token_id.item()
-                buf_ids.write(f"{token_id_val}\n")
-                
-                # Validate token ID is within valid range before decoding
-                if 0 <= token_id_val < vocab_size:
-                    try:
-                        decoded_token = tokenizer.decode([token_id_val], skip_special_tokens=True)
-                        buf_tokens.write(decoded_token + "\n")
-                    except Exception as e:
-                        # Log the error and skip this token
-                        buf_tokens.write(f"[INVALID_TOKEN_{token_id_val}]\n")
-                else:
-                    buf_tokens.write(f"[OUT_OF_RANGE_TOKEN_{token_id_val}]\n")
+            if masked_toks_row:
+                masked_freq.update(masked_toks_row)
 
-            if mask.sum().item() == 0:
-                try:
-                    # Filter out invalid token IDs before decoding the full sequence
-                    valid_ids = [id_val.item() for id_val in ids if 0 <= id_val.item() < vocab_size]
-                    if valid_ids:
-                        decoded_sentence = tokenizer.decode(valid_ids, skip_special_tokens=True)
-                        buf_sentences.write(decoded_sentence + "\n")
-                    else:
-                        buf_sentences.write("[NO_VALID_TOKENS]\n")
-                except Exception as e:
-                    buf_sentences.write(f"[DECODE_ERROR: {str(e)}]\n")
+        # -------------------------
+        # 4) All sentences + freq
+        # -------------------------
+        seqs_for_batch = []
+        for b in range(B):
+            L = int(len_np[b])
+            if L <= 0:
+                seqs_for_batch.append([])
+                continue
+            row = [int(t) for t in ids_np[b, :L].tolist() if t != pad_id and 0 <= t < vocab_size]
+            seqs_for_batch.append(row)
 
+        all_sentences = tokenizer.batch_decode(seqs_for_batch, skip_special_tokens=True)
 
-        # Rewind buffers
-        buf_ids.seek(0)
-        buf_tokens.seek(0)
-        buf_sentences.seek(0)
+        all_sentences_buf = io.StringIO()
+        all_token_freq = Counter()
 
-        # Write to temp files
-        if self.accelerator.is_main_process:
+        for b, sent in enumerate(all_sentences):
+            all_sentences_buf.write((sent if sent else "") + "\n")
+
+            L = int(len_np[b])
+            if L <= 0:
+                continue
+            for tid in ids_np[b, :L]:
+                tid = int(tid)
+                if tid == pad_id or not (0 <= tid < vocab_size):
+                    continue
+                tok = id_to_decoded.get(tid, "")
+                if tok:
+                    all_token_freq.update([tok])
+
+        # -------------------------
+        # 5) Rank 0: write files + W&B artifact
+        # -------------------------
+        if acc.is_main_process:
             temp_files = []
-            def write_temp_file(buf, filename):
-                tmp = tempfile.NamedTemporaryFile(mode="w+", suffix=".txt", delete=False)
-                tmp.write(buf.read())
-                tmp.flush()
+
+            def write_temp_file(buf_or_obj, filename, is_json=False):
+                if is_json:
+                    tmp = tempfile.NamedTemporaryFile(mode="w+", suffix=".json", delete=False)
+                    json.dump(buf_or_obj, tmp, ensure_ascii=False, indent=2)
+                    tmp.flush()
+                else:
+                    tmp = tempfile.NamedTemporaryFile(mode="w+", suffix=".txt", delete=False)
+                    tmp.write(buf_or_obj.read())
+                    tmp.flush()
                 temp_files.append((tmp.name, filename))
 
-            write_temp_file(buf_ids, f"masked_token_ids_{name_suffix}.txt")
-            write_temp_file(buf_tokens, f"masked_tokens_{name_suffix}.txt")
-            write_temp_file(buf_sentences, f"fully_masked_sentences_{name_suffix}.txt")
+            write_temp_file(masked_buf, f"masked_tokens_per_sentence_{name_suffix}.txt")
+            write_temp_file(all_sentences_buf, f"all_sentences_{name_suffix}.txt")
+            write_temp_file(dict(masked_freq), f"masked_token_freq_{name_suffix}.json", is_json=True)
+            write_temp_file(dict(all_token_freq), f"all_token_freq_{name_suffix}.json", is_json=True)
 
-            # Create and log artifact
-            artifact = wandb.Artifact(f"masked_tokens_{name_suffix}", type="mask_data")
+            artifact = wandb.Artifact(f"masking_stats_{name_suffix}", type="mask_data")
             for path, filename in temp_files:
                 artifact.add_file(path, name=filename)
+            try:
+                wandb.log_artifact(artifact)
+            except AttributeError:
+                wandb.run.log_artifact(artifact)
 
-            wandb.run.log_artifact(artifact)
-
-            # Clean up
             for path, _ in temp_files:
                 os.remove(path)
+
+        acc.wait_for_everyone()
+
     
     def _log_stats(self, stats_dict, mode):
         rewards_per_func = stats_dict['rewards_per_func']

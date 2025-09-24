@@ -61,7 +61,7 @@ for MODEL_ID in "${!model_revisions[@]}"; do
                 "$WANDB_RUN_PATH" "$MAX_MODEL_LENGTH" \
                 "$TENSOR_PARALLEL" "$TRUST_REMOTE_CODE" "$SYSTEM_PROMPT")
         else
-            JOB_SUBMIT_OUTPUT=$($CMD evaluate_revision.sh \
+            JOB_SUBMIT_OUTPUT=$($CMD evaluate_revision_a100.sh \
                 "$TASK_NAME" "$MODEL_ID" "$MODEL_REVISION" "$STEP" \
                 "$WANDB_RUN_PATH" "$MAX_MODEL_LENGTH" \
                 "$TENSOR_PARALLEL" "$TRUST_REMOTE_CODE" "$SYSTEM_PROMPT")
